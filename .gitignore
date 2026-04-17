@@ -1,0 +1,5 @@
+# Generated CAMELS preprocessing outputs
+processed/
+
+# Jupyter local metadata
+.ipynb_checkpoints/
