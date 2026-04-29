@@ -1,22 +1,32 @@
 #!/bin/bash -l
 #SBATCH --job-name=camels_vit_qobs
-#SBATCH --partition=general
-#SBATCH --nodes=1
+#SBATCH -o ./slurm_logs/%x_%j.out
+#SBATCH -e ./slurm_logs/%x_%j.err
+#SBATCH -D /u/xshan/camels_train/data/CAMELS_data_load
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:1
+#SBATCH --constraint="gpu"
+#SBATCH --gres=gpu:a100:1
+#SBATCH --cpus-per-task=18
+#SBATCH --mem=125000
+#SBATCH --mail-type=none
 #SBATCH --time=23:50:00
 #SBATCH --signal=B:USR1@600
-#SBATCH --chdir=/u/xshan/Research/GT/cs7643_DL/courseProject/CAMELS_data_load
-#SBATCH --output=slurm_logs/%x_%j.out
-#SBATCH --error=slurm_logs/%x_%j.err
 
 set -uo pipefail
 
-PROJECT_DIR="/u/xshan/Research/GT/cs7643_DL/courseProject/CAMELS_data_load"
+if [[ -n "${SLURM_SUBMIT_DIR:-}" && -f "${SLURM_SUBMIT_DIR}/train_vanilla_transformer_qobs.py" ]]; then
+  PROJECT_DIR="$(cd "${SLURM_SUBMIT_DIR}" && pwd)"
+else
+  PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 SCRIPT_PATH="${PROJECT_DIR}/submit_raven_vanilla_transformer_qobs.sh"
 PYTHON_SCRIPT="${PROJECT_DIR}/train_vanilla_transformer_qobs.py"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+DEFAULT_ENV_PYTHON="/u/xshan/conda-envs/dl_project/bin/python"
+if [[ -z "${PYTHON_BIN:-}" && -x "${DEFAULT_ENV_PYTHON}" ]]; then
+  PYTHON_BIN="${DEFAULT_ENV_PYTHON}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python}"
+fi
 
 RUN_NAME="${RUN_NAME:-raven_default}"
 ROUND="${ROUND:-1}"
@@ -30,6 +40,9 @@ DONE_FLAG="${RUN_DIR}/DONE"
 mkdir -p "${PROJECT_DIR}/slurm_logs"
 mkdir -p "${OUTPUT_ROOT}"
 mkdir -p "${RUN_DIR}"
+
+module purge
+module load intel/21.2.0 impi/2021.2 cuda/11.2
 
 cd "${PROJECT_DIR}"
 
@@ -48,6 +61,8 @@ echo "JOBID=${SLURM_JOB_ID} ROUND=${ROUND} MAX_ROUNDS=${MAX_ROUNDS}"
 echo "RUN_NAME=${RUN_NAME}"
 echo "RUN_DIR=${RUN_DIR}"
 echo "DATA_DIR=${DATA_DIR}"
+echo "PROJECT_DIR=${PROJECT_DIR}"
+echo "SLURM_SUBMIT_DIR=${SLURM_SUBMIT_DIR:-unset}"
 echo "PYTHON_BIN=${PYTHON_BIN}"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 

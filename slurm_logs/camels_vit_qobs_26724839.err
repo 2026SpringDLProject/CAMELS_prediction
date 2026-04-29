@@ -1,0 +1,5 @@
+mkdir: cannot create directory '/var/spool/slurmd/job26724839/slurm_logs': Permission denied
+mkdir: cannot create directory '/var/spool/slurmd/job26724839/model_artifacts': Permission denied
+mkdir: cannot create directory '/var/spool/slurmd/job26724839/model_artifacts': Permission denied
+/u/xshan/conda-envs/dl_project/bin/python: can't open file '/var/spool/slurmd/job26724839/train_vanilla_transformer_qobs.py': [Errno 2] No such file or directory
+sbatch: error: Unable to open file /var/spool/slurmd/job26724839/submit_raven_vanilla_transformer_qobs.sh

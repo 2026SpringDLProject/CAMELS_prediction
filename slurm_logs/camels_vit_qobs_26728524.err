@@ -1,0 +1,66 @@
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+/raven/u/xshan/camels_train/data/CAMELS_data_load/train_vanilla_transformer_qobs.py:549: UserWarning: enable_nested_tensor is True, but self.use_nested_tensor is False because encoder_layer.norm_first was True
+  self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)

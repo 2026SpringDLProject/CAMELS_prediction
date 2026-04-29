@@ -1,0 +1,36 @@
+JOBID=26724839 ROUND=1 MAX_ROUNDS=50
+RUN_NAME=raven_default
+RUN_DIR=/var/spool/slurmd/job26724839/model_artifacts/raven_default
+DATA_DIR=/var/spool/slurmd/job26724839/processed
+PYTHON_BIN=/u/xshan/conda-envs/dl_project/bin/python
+CUDA_VISIBLE_DEVICES=0
+Launching training command: /u/xshan/conda-envs/dl_project/bin/python /var/spool/slurmd/job26724839/train_vanilla_transformer_qobs.py --device cuda --data-dir /var/spool/slurmd/job26724839/processed --output-dir /var/spool/slurmd/job26724839/model_artifacts --run-name raven_default --num-workers 4 --pin-memory
+Training command exited with code 2
+DONE flag not found. Resubmitting round 2 after job 26724839.
+                                  
+================================= 
+Global information about the job: 
+================================= 
+  
+Job owner: xshan(41816)
+Job name:  camels_vit_qobs
+Node list: ravg1119
+Job start: Tue Apr 28 18:45:37 CEST 2026
+Job end:   Tue Apr 28 18:45:41 CEST 2026
+Work dir:  /u/xshan/camels_train/data/CAMELS_data_load
+Command:   /raven/u/xshan/camels_train/data/CAMELS_data_load/submit_raven_vanilla_transformer_qobs.sh
+  
+  
+  
+==========================================================================================
+Information on jobsteps (Note: MaxRSS/AveRSS is the maximum/average over all 
+tasks of the per-task memory high-water marks; cf. "man sacct"): 
+==========================================================================================
+  
+JobID            JobName NNodes NTasks  NCPUS       MaxRSS       AveRSS    Elapsed ExitCode
+------------- ---------- ------ ------ ------ ------------ ------------ ---------- --------
+26724839      camels_vit      1            36                             00:00:04      2:0
+  
+Maximum memory per node: 0.028266 GB (defined as MaxRSS*Ntasks/NNodes)
+CPU utilization: 1.4 %
+  
