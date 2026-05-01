@@ -3,3 +3,4 @@ processed/
 
 # Jupyter local metadata
 .ipynb_checkpoints/
+*.zip

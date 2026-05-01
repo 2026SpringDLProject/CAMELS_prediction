@@ -1,0 +1,171 @@
+{
+  "DATA_DIR": "C:\\Users\\llldt\\Downloads\\courseProject\\CAMELS_data_load\\processed",
+  "JOINED_FILENAME_PREFERENCE": [
+    "camels_transformer_joined.parquet",
+    "camels_transformer_joined.csv"
+  ],
+  "METADATA_FILENAME": "camels_transformer_metadata.json",
+  "OUTPUT_DIR": "C:\\Users\\llldt\\Downloads\\courseProject\\CAMELS_data_load\\model_artifacts",
+  "RUN_NAME": "itransformer_default",
+  "BASIN_IDS": [],
+  "LOOKBACK_DAYS": 365,
+  "PREDICTION_HORIZON_DAYS": 1,
+  "USE_ALL_FEATURES": true,
+  "INDEPENDENT_VAL_START": "2008-01-01",
+  "INDEPENDENT_VAL_END": "2014-12-31",
+  "CV_NUM_FOLDS": 4,
+  "SEED": 7643,
+  "DEVICE": "cuda",
+  "NUM_WORKERS": 0,
+  "PIN_MEMORY": true,
+  "SEARCH_TRIALS": 8,
+  "SEARCH_EPOCHS": 6,
+  "SEARCH_PATIENCE": 2,
+  "FINAL_MAX_EPOCHS": 20,
+  "TUNING_MAX_TRAIN_WINDOWS": 50000,
+  "TUNING_MAX_VAL_WINDOWS": 15000,
+  "SAVE_CHECKPOINTS": true,
+  "RUN_DIR": "C:\\Users\\llldt\\Downloads\\courseProject\\CAMELS_data_load\\model_artifacts\\itransformer_default",
+  "FEATURE_COLUMNS": [
+    "Dayl(s)",
+    "PRCP(mm/day)",
+    "SRAD(W/m2)",
+    "SWE(mm)",
+    "Tmax(C)",
+    "Tmin(C)",
+    "Vp(Pa)",
+    "doy_sin",
+    "doy_cos",
+    "basin_code"
+  ],
+  "DYNAMIC_FEATURE_COLUMNS": [
+    "Dayl(s)",
+    "PRCP(mm/day)",
+    "SRAD(W/m2)",
+    "SWE(mm)",
+    "Tmax(C)",
+    "Tmin(C)",
+    "Vp(Pa)",
+    "doy_sin",
+    "doy_cos"
+  ],
+  "BASIN_CODE_COLUMN": "basin_code",
+  "TARGET_COLUMN": "QObs(mm/day)",
+  "NUM_BASINS": 671,
+  "FINAL_EPOCHS_FROM_CV": 5,
+  "PROTOCOL": {
+    "holdout_start": "2008-01-01",
+    "holdout_end": "2014-12-31",
+    "cv_folds": [
+      {
+        "fold_id": 0,
+        "train_years": [
+          1980,
+          1981,
+          1982,
+          1983,
+          1984,
+          1985
+        ],
+        "val_years": [
+          1986,
+          1987,
+          1988,
+          1989,
+          1990,
+          1991
+        ]
+      },
+      {
+        "fold_id": 1,
+        "train_years": [
+          1980,
+          1981,
+          1982,
+          1983,
+          1984,
+          1985,
+          1986,
+          1987,
+          1988,
+          1989,
+          1990,
+          1991
+        ],
+        "val_years": [
+          1992,
+          1993,
+          1994,
+          1995,
+          1996,
+          1997
+        ]
+      },
+      {
+        "fold_id": 2,
+        "train_years": [
+          1980,
+          1981,
+          1982,
+          1983,
+          1984,
+          1985,
+          1986,
+          1987,
+          1988,
+          1989,
+          1990,
+          1991,
+          1992,
+          1993,
+          1994,
+          1995,
+          1996,
+          1997
+        ],
+        "val_years": [
+          1998,
+          1999,
+          2000,
+          2001,
+          2002
+        ]
+      },
+      {
+        "fold_id": 3,
+        "train_years": [
+          1980,
+          1981,
+          1982,
+          1983,
+          1984,
+          1985,
+          1986,
+          1987,
+          1988,
+          1989,
+          1990,
+          1991,
+          1992,
+          1993,
+          1994,
+          1995,
+          1996,
+          1997,
+          1998,
+          1999,
+          2000,
+          2001,
+          2002
+        ],
+        "val_years": [
+          2003,
+          2004,
+          2005,
+          2006,
+          2007
+        ]
+      }
+    ]
+  }
+}
