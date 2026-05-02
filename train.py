@@ -30,6 +30,11 @@ DEFAULT_CONFIG_PATH = CONFIG_DIR / "train.json"
 DECODER_FUTURE_KNOWN_FEATURES = ("Dayl(s)", "doy_sin", "doy_cos")
 EXPECTED_DATASET_FORMAT = "flat_indexed_v3"
 EXPECTED_TARGET_TRANSFORM = "identity"
+CV_NUM_FOLDS = 4
+CV_TRAIN_RATIO = 0.8
+TEMPORAL_TRAIN_RATIO = 0.7
+TEMPORAL_VAL_RATIO = 0.15
+TEMPORAL_TEST_RATIO = 0.15
 
 
 @dataclass
@@ -51,9 +56,6 @@ class TrainConfig:
     max_windows: Optional[int] = None
     write_flat_files: bool = False
     rebuild_dataset: bool = False
-    loss_name: str = "mse"
-    mse_warmup_epochs: int = 0
-    mse_weight: float = 0.5
     batch_size: int = 64
     epochs: int = 30
     early_stopping_patience: int = 8
@@ -61,22 +63,14 @@ class TrainConfig:
     lr: float = 1e-3
     weight_decay: float = 1e-4
     grad_clip: float = 1.0
-    warmup_epochs: int = 0
-    warmup_start_factor: float = 0.1
-    split_strategy: str = "ratio"
-    cv_num_folds: int = 4
-    cv_train_ratio: float = 0.8
-    train_ratio: float = 0.7
-    val_ratio: float = 0.15
-    test_ratio: float = 0.15
     random_seed: int = 42
     num_workers: int = 0
-    model_name: str = "tft"
     d_model: int = 64
     lstm_hidden: int = 64
     n_heads: int = 4
     dropout: float = 0.1
     prediction_length: int = 1
+    model_name: str = "tft"
 
 
 class CamelsWindowDataset(Dataset):
@@ -237,75 +231,6 @@ class CamelsWindowDataset(Dataset):
         return item
 
 
-class NSELoss(nn.Module):
-    """Kratzert et al. (2019) basin-averaged NSE* loss.
-
-    Reference:
-        Kratzert, F., Klotz, D., Shalev, G., Klambauer, G., Hochreiter, S., Nearing, G.
-        (2019). "Towards learning universal, regional, and local hydrological behaviors
-        via machine learning applied to large-sample datasets." HESS, 23, 5089-5110.
-
-    Implements (Eq. 1 in the paper):
-        L = (1/B) * sum_b (1/N_b) * sum_n (y_n - y_hat_n)^2 / (s_b + eps)^2
-    where:
-        y, y_hat are observed and predicted streamflow in physical mm/day,
-        s_b is the std of training observations for basin b (mm/day) — precomputed
-            from the training split only, so it is a fixed, basin-specific constant
-            (this is what makes the loss stable under mini-batch shuffling),
-        eps is a small constant (paper default: 0.1).
-
-    Because this codebase trains the model in z-scored log1p space for optimization
-    stability, we denormalize predictions to mm/day inside the loss and apply NSE*
-    in physical units exactly as the paper specifies. A clamp on the pre-expm1 value
-    prevents runaway gradients early in training when predictions are far off, and
-    the denormalized prediction is clamped to non-negative runoff.
-    """
-
-    def __init__(self, eps: float = 0.1, log_clip: float = 10.0):
-        super().__init__()
-        self.eps = eps
-        self.log_clip = log_clip
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        raw_target: torch.Tensor,
-        basin_slot: Optional[torch.Tensor] = None,
-        target_mean: Optional[torch.Tensor] = None,
-        target_std: Optional[torch.Tensor] = None,
-        target_std_raw: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if (
-            basin_slot is None
-            or target_mean is None
-            or target_std is None
-            or target_std_raw is None
-        ):
-            # No per-basin info; fall back to MSE on whatever space pred is in.
-            return ((pred - raw_target) ** 2).mean()
-
-        sigma_log = target_std[basin_slot]
-        mu_log = target_mean[basin_slot]
-        sigma_raw = target_std_raw[basin_slot]
-        if pred.ndim == 2:
-            sigma_log = sigma_log.unsqueeze(-1)
-            mu_log = mu_log.unsqueeze(-1)
-            sigma_raw = sigma_raw.unsqueeze(-1)
-
-        pred_log = pred * sigma_log + mu_log
-        pred_log = torch.clamp(pred_log, max=self.log_clip, min=-20.0)
-        pred_phys = torch.clamp(torch.expm1(pred_log), min=0.0)
-
-        squared_error = (pred_phys - raw_target) ** 2
-        denom = (sigma_raw + self.eps) ** 2
-        element_loss = squared_error / denom
-
-        basin_losses = []
-        for slot in torch.unique(basin_slot):
-            basin_losses.append(element_loss[basin_slot == slot].mean())
-        return torch.stack(basin_losses).mean()
-
-
 class GlobalNSELoss(nn.Module):
     """Vanilla-transformer style global NSE loss over the current mini-batch.
 
@@ -327,53 +252,6 @@ class GlobalNSELoss(nn.Module):
         numerator = torch.sum((pred_flat - target_flat) ** 2)
         denominator = torch.sum((target_flat - torch.mean(target_flat)) ** 2) + self.eps
         return numerator / denominator
-
-
-class MixedLoss(nn.Module):
-    """Weighted MSE (z-scored log1p space) + Kratzert NSE* (physical mm/day).
-
-    L = mse_weight * MSE(pred, target_z) + (1 - mse_weight) * NSE*(pred, raw_target)
-
-    MSE provides a smooth, well-conditioned signal early in training; NSE*
-    aligns with the hydrology evaluation metric. With LR warmup, MSE-heavy
-    mixing in early epochs followed by an NSE-heavy schedule is a common
-    recipe — for the simple version here we use a fixed weight.
-    """
-
-    def __init__(self, mse_weight: float = 0.5, eps: float = 0.1, log_clip: float = 10.0):
-        super().__init__()
-        if not 0.0 <= mse_weight <= 1.0:
-            raise ValueError(f"mse_weight must be in [0, 1], got {mse_weight}")
-        self.mse_weight = float(mse_weight)
-        self.nse = NSELoss(eps=eps, log_clip=log_clip)
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target_z: torch.Tensor,
-        raw_target: torch.Tensor,
-        basin_slot: Optional[torch.Tensor] = None,
-        target_mean: Optional[torch.Tensor] = None,
-        target_std: Optional[torch.Tensor] = None,
-        target_std_raw: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        mse_term = ((pred - target_z) ** 2).mean()
-        if (
-            basin_slot is None
-            or target_mean is None
-            or target_std is None
-            or target_std_raw is None
-        ):
-            return mse_term
-        nse_term = self.nse(
-            pred,
-            raw_target,
-            basin_slot=basin_slot,
-            target_mean=target_mean,
-            target_std=target_std,
-            target_std_raw=target_std_raw,
-        )
-        return self.mse_weight * mse_term + (1.0 - self.mse_weight) * nse_term
 
 
 def denormalize_targets(
@@ -546,10 +424,10 @@ def infer_num_basins_from_dataset(dataset: CamelsWindowDataset, basin_idx: int) 
 def temporal_split_indices(
     dataset: CamelsWindowDataset, cfg: TrainConfig
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    total_ratio = cfg.train_ratio + cfg.val_ratio + cfg.test_ratio
+    total_ratio = TEMPORAL_TRAIN_RATIO + TEMPORAL_VAL_RATIO + TEMPORAL_TEST_RATIO
     if not math.isclose(total_ratio, 1.0, rel_tol=1e-6, abs_tol=1e-6):
         raise ValueError(
-            f"train/val/test ratios must sum to 1.0, got {cfg.train_ratio}, {cfg.val_ratio}, {cfg.test_ratio}"
+            "train/val/test ratios must sum to 1.0"
         )
 
     n_samples = len(dataset)
@@ -563,8 +441,8 @@ def temporal_split_indices(
         rng = np.random.default_rng(cfg.random_seed)
         order = rng.permutation(n_samples)
 
-    train_end = max(1, int(n_samples * cfg.train_ratio))
-    val_end = min(n_samples - 1, train_end + max(1, int(n_samples * cfg.val_ratio)))
+    train_end = max(1, int(n_samples * TEMPORAL_TRAIN_RATIO))
+    val_end = min(n_samples - 1, train_end + max(1, int(n_samples * TEMPORAL_VAL_RATIO)))
 
     train_idx = order[:train_end]
     val_idx = order[train_end:val_end]
@@ -586,16 +464,11 @@ def expanding_cv_split_indices(
         raise ValueError(
             "Per-basin expanding-window CV requires window_basin_index in the prepared dataset."
         )
-    if cfg.cv_num_folds < 1:
-        raise ValueError(f"cv_num_folds must be >= 1, got {cfg.cv_num_folds}")
-    if not 0.0 < cfg.cv_train_ratio < 1.0:
-        raise ValueError(f"cv_train_ratio must be in (0, 1), got {cfg.cv_train_ratio}")
-
     dates = np.asarray(dataset.target_date).astype("datetime64[D]")
     basin_slots = np.asarray(dataset.window_basin_index, dtype=np.int64)
     if len(dates) != len(basin_slots):
         raise ValueError("target_date and window_basin_index must have the same length.")
-    if len(dates) < cfg.cv_num_folds + 2:
+    if len(dates) < CV_NUM_FOLDS + 2:
         raise ValueError("Not enough samples to build expanding-window CV splits.")
 
     basin_ids = (
@@ -611,7 +484,7 @@ def expanding_cv_split_indices(
     for basin_slot in np.unique(basin_slots):
         basin_idx = np.flatnonzero(basin_slots == basin_slot)
         basin_order = basin_idx[np.argsort(dates[basin_idx], kind="stable")]
-        min_needed = cfg.cv_num_folds + 2
+        min_needed = CV_NUM_FOLDS + 2
         label = (
             basin_ids[int(basin_slot)]
             if basin_ids is not None and int(basin_slot) < len(basin_ids)
@@ -621,11 +494,11 @@ def expanding_cv_split_indices(
             skipped.append(f"{label}({len(basin_order)} windows)")
             continue
 
-        pre_end = int(len(basin_order) * cfg.cv_train_ratio)
-        pre_end = max(cfg.cv_num_folds + 1, min(len(basin_order) - 1, pre_end))
+        pre_end = int(len(basin_order) * CV_TRAIN_RATIO)
+        pre_end = max(CV_NUM_FOLDS + 1, min(len(basin_order) - 1, pre_end))
         basin_pre = basin_order[:pre_end]
         basin_holdout = basin_order[pre_end:]
-        chunks = [chunk for chunk in np.array_split(basin_pre, cfg.cv_num_folds + 1)]
+        chunks = [chunk for chunk in np.array_split(basin_pre, CV_NUM_FOLDS + 1)]
         if len(basin_holdout) == 0 or any(len(chunk) == 0 for chunk in chunks):
             skipped.append(f"{label}({len(basin_order)} windows)")
             continue
@@ -639,13 +512,13 @@ def expanding_cv_split_indices(
         suffix = "..." if len(skipped) > 10 else ""
         raise ValueError(
             "Some basins do not have enough windows for per-basin expanding-window CV: "
-            f"{preview}{suffix}. Reduce cv_num_folds or use a denser window stride."
+            f"{preview}{suffix}. Use a denser window stride or a longer training period."
         )
     if not basin_chunks:
         raise ValueError("No basins had enough samples to build expanding-window CV splits.")
 
     folds: List[Dict[str, Any]] = []
-    for fold_id in range(cfg.cv_num_folds):
+    for fold_id in range(CV_NUM_FOLDS):
         train_parts = []
         val_parts = []
         for chunks in basin_chunks.values():
@@ -750,15 +623,6 @@ def run_epoch(
     per_basin_sum = torch.zeros(max(n_basins, 1), dtype=torch.float64, device=device)
     per_basin_sum_sq = torch.zeros(max(n_basins, 1), dtype=torch.float64, device=device)
     per_basin_count = torch.zeros(max(n_basins, 1), dtype=torch.float64, device=device)
-    track_epoch_nse_loss = (
-        isinstance(criterion, (NSELoss, MixedLoss))
-        and track_per_basin
-        and target_std_raw is not None
-    )
-    per_basin_nse_loss_sum = torch.zeros(max(n_basins, 1), dtype=torch.float64, device=device)
-    per_basin_nse_loss_count = torch.zeros(max(n_basins, 1), dtype=torch.float64, device=device)
-    z_mse_sum = 0.0
-    z_mse_count = 0
 
     for batch in loader:
         x = batch["x"].to(device)
@@ -788,32 +652,7 @@ def run_epoch(
 
         with torch.set_grad_enabled(is_train):
             pred, _ = model(x, future_known=future_known, static_features=static_features)
-            if isinstance(criterion, MixedLoss):
-                loss = criterion(
-                    pred,
-                    target,
-                    raw_target,
-                    basin_slot=basin_slot,
-                    target_mean=target_mean,
-                    target_std=target_std,
-                    target_std_raw=target_std_raw,
-                )
-            elif isinstance(criterion, NSELoss):
-                loss = criterion(
-                    pred,
-                    raw_target,
-                    basin_slot=basin_slot,
-                    target_mean=target_mean,
-                    target_std=target_std,
-                    target_std_raw=target_std_raw,
-                )
-            else:
-                loss = criterion(pred, target)
-
-        if isinstance(criterion, MixedLoss):
-            z_diff = (pred.detach() - target.detach()).reshape(-1).double()
-            z_mse_sum += torch.sum(z_diff * z_diff).item()
-            z_mse_count += z_diff.numel()
+            loss = criterion(pred, target)
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -829,38 +668,21 @@ def run_epoch(
         pred_detached = pred.detach()
         raw_target_detached = raw_target.detach()
 
-        loss_log_clip = None
-        if isinstance(criterion, MixedLoss):
-            loss_log_clip = criterion.nse.log_clip
-        elif isinstance(criterion, NSELoss):
-            loss_log_clip = criterion.log_clip
-
         if target_mean is not None and target_std is not None and basin_slot is not None:
             pred_phys = denormalize_targets(pred_detached, basin_slot, target_mean, target_std)
-            pred_phys_for_loss = denormalize_targets(
-                pred_detached,
-                basin_slot,
-                target_mean,
-                target_std,
-                log_clip=loss_log_clip,
-            )
             target_phys = raw_target_detached
         else:
             pred_phys = pred_detached
-            pred_phys_for_loss = pred_detached
             target_phys = raw_target_detached
 
         if pred_phys.ndim == 1:
             pred_phys = pred_phys.unsqueeze(-1)
-            pred_phys_for_loss = pred_phys_for_loss.unsqueeze(-1)
             target_phys = target_phys.unsqueeze(-1)
 
         horizon = pred_phys.size(-1)
         pred_flat = pred_phys.reshape(-1).double()
-        pred_loss_flat = pred_phys_for_loss.reshape(-1).double()
         target_flat = target_phys.reshape(-1).double()
         diff = pred_flat - target_flat
-        loss_diff = pred_loss_flat - target_flat
 
         abs_err_sum += torch.sum(torch.abs(diff)).item()
         sq_err_sum += torch.sum(diff * diff).item()
@@ -877,34 +699,8 @@ def run_epoch(
             per_basin_sum.scatter_add_(0, slot_per_elem, target_flat)
             per_basin_sum_sq.scatter_add_(0, slot_per_elem, target_flat * target_flat)
             per_basin_count.scatter_add_(0, slot_per_elem, torch.ones_like(target_flat))
-            if track_epoch_nse_loss:
-                if isinstance(criterion, MixedLoss):
-                    nse_eps = criterion.nse.eps
-                else:
-                    nse_eps = criterion.eps
-                denom = (target_std_raw[slot_per_elem].double() + nse_eps) ** 2
-                element_nse_loss = (loss_diff * loss_diff) / denom
-                per_basin_nse_loss_sum.scatter_add_(0, slot_per_elem, element_nse_loss)
-                per_basin_nse_loss_count.scatter_add_(
-                    0, slot_per_elem, torch.ones_like(element_nse_loss)
-                )
 
     mean_loss = loss_sum / sample_count
-    if track_epoch_nse_loss:
-        valid_loss = per_basin_nse_loss_count > 0
-        if bool(valid_loss.any()):
-            epoch_nse_loss = (
-                per_basin_nse_loss_sum[valid_loss] / per_basin_nse_loss_count[valid_loss]
-            ).mean().item()
-            if isinstance(criterion, MixedLoss):
-                if z_mse_count > 0:
-                    epoch_mse_loss = z_mse_sum / z_mse_count
-                    mean_loss = (
-                        criterion.mse_weight * epoch_mse_loss
-                        + (1.0 - criterion.mse_weight) * epoch_nse_loss
-                    )
-            else:
-                mean_loss = epoch_nse_loss
     overall_mae = abs_err_sum / max(element_count, 1)
     overall_rmse = math.sqrt(max(sq_err_sum / max(element_count, 1), 0.0))
     global_sst = target_sum_sq - (target_sum * target_sum / max(element_count, 1))
@@ -988,41 +784,34 @@ def build_model(dataset: CamelsWindowDataset, cfg: TrainConfig) -> nn.Module:
         )
 
     model_name = cfg.model_name.lower()
-    common_kwargs = {
-        "num_real_features": num_real_features,
-        "num_basins": num_basins,
-        "prediction_length": cfg.prediction_length,
-        "num_future_known_features": len(dataset.future_known_feature_columns),
-        "num_static_features": dataset.num_static_features,
-        "d_model": cfg.d_model,
-        "lstm_hidden": cfg.lstm_hidden,
-        "dropout": cfg.dropout,
-    }
-    if model_name in {"tft", "simple_tft", "simple-tft"}:
+    if model_name in {"lstm", "lstm_baseline", "baseline"}:
+        return LSTMBaseline(
+            num_real_features=num_real_features,
+            num_basins=num_basins,
+            prediction_length=cfg.prediction_length,
+            num_future_known_features=len(dataset.future_known_feature_columns),
+            num_static_features=dataset.num_static_features,
+            d_model=cfg.d_model,
+            lstm_hidden=cfg.lstm_hidden,
+            dropout=cfg.dropout,
+        )
+    if model_name in {"tft", "simple_tft"}:
         return SimpleTFT(
-            **common_kwargs,
+            num_real_features=num_real_features,
+            num_basins=num_basins,
+            prediction_length=cfg.prediction_length,
+            num_future_known_features=len(dataset.future_known_feature_columns),
+            num_static_features=dataset.num_static_features,
+            d_model=cfg.d_model,
+            lstm_hidden=cfg.lstm_hidden,
+            dropout=cfg.dropout,
             n_heads=cfg.n_heads,
         )
-    if model_name in {"lstm", "lstm_baseline", "lstm-baseline"}:
-        return LSTMBaseline(**common_kwargs)
-    raise ValueError(
-        f"Unsupported model_name={cfg.model_name!r}. Expected 'tft' or 'lstm'."
-    )
+    raise ValueError(f"Unknown model_name={cfg.model_name!r}; expected 'tft' or 'lstm'.")
 
 
 def build_criterion(cfg: TrainConfig) -> nn.Module:
-    loss_name = cfg.loss_name.lower()
-    if loss_name == "mse":
-        return nn.MSELoss()
-    if loss_name == "nse":
-        return NSELoss()
-    if loss_name in {"global_nse", "global-nse"}:
-        return GlobalNSELoss()
-    if loss_name == "mixed":
-        return MixedLoss(mse_weight=cfg.mse_weight)
-    raise ValueError(
-        f"Unsupported loss_name={cfg.loss_name!r}. Expected 'mse', 'nse', 'global_nse', or 'mixed'."
-    )
+    return GlobalNSELoss()
 
 
 def normalization_tensors_for_split(
@@ -1079,7 +868,6 @@ def train_one_split(
 ) -> Dict[str, Any]:
     model = build_model(dataset, cfg).to(device)
     criterion = build_criterion(cfg)
-    mse_warmup_criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.lr,
@@ -1091,16 +879,6 @@ def train_one_split(
         factor=0.5,
         patience=3,
     )
-    warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
-    if cfg.warmup_epochs > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=cfg.warmup_start_factor,
-            end_factor=1.0,
-            total_iters=cfg.warmup_epochs,
-        )
-    else:
-        warmup_scheduler = None
 
     train_loader = make_loader(dataset, train_idx, cfg.batch_size, True, cfg.num_workers, device)
     val_loader = make_loader(dataset, val_idx, cfg.batch_size, False, cfg.num_workers, device)
@@ -1117,15 +895,10 @@ def train_one_split(
     epochs_without_improvement = 0
 
     for epoch in range(1, cfg.epochs + 1):
-        active_criterion = (
-            mse_warmup_criterion
-            if cfg.loss_name.lower() != "mse" and epoch <= cfg.mse_warmup_epochs
-            else criterion
-        )
         train_metrics = run_epoch(
             model=model,
             loader=train_loader,
-            criterion=active_criterion,
+            criterion=criterion,
             device=device,
             optimizer=optimizer,
             grad_clip=cfg.grad_clip,
@@ -1138,14 +911,11 @@ def train_one_split(
             device,
             **stats,
         )
-        if warmup_scheduler is not None and epoch <= cfg.warmup_epochs:
-            warmup_scheduler.step()
-        else:
-            scheduler.step(val_metrics["loss"])
+        scheduler.step(val_metrics["loss"])
 
         epoch_metrics = {
             "epoch": epoch,
-            "loss_name": "mse_warmup" if active_criterion is mse_warmup_criterion else cfg.loss_name,
+            "loss_name": "global_nse",
             "train_loss": train_metrics["loss"],
             "train_mae": train_metrics["mae"],
             "train_rmse": train_metrics["rmse"],
@@ -1328,18 +1098,7 @@ def train_expanding_cv(cfg: TrainConfig, dataset: CamelsWindowDataset, device: t
     set_seed(cfg.random_seed)
     model = build_model(dataset, cfg).to(device)
     criterion = build_criterion(cfg)
-    mse_warmup_criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler]
-    if cfg.warmup_epochs > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=cfg.warmup_start_factor,
-            end_factor=1.0,
-            total_iters=cfg.warmup_epochs,
-        )
-    else:
-        warmup_scheduler = None
 
     final_train_loader = make_loader(
         dataset, pre_holdout_idx, cfg.batch_size, True, cfg.num_workers, device
@@ -1351,25 +1110,18 @@ def train_expanding_cv(cfg: TrainConfig, dataset: CamelsWindowDataset, device: t
 
     final_history: List[Dict[str, float]] = []
     for epoch in range(1, final_epochs + 1):
-        active_criterion = (
-            mse_warmup_criterion
-            if cfg.loss_name.lower() != "mse" and epoch <= cfg.mse_warmup_epochs
-            else criterion
-        )
         train_metrics = run_epoch(
             model=model,
             loader=final_train_loader,
-            criterion=active_criterion,
+            criterion=criterion,
             device=device,
             optimizer=optimizer,
             grad_clip=cfg.grad_clip,
             **stats,
         )
-        if warmup_scheduler is not None and epoch <= cfg.warmup_epochs:
-            warmup_scheduler.step()
         row = {
             "epoch": epoch,
-            "loss_name": "mse_warmup" if active_criterion is mse_warmup_criterion else cfg.loss_name,
+            "loss_name": "global_nse",
             "train_loss": train_metrics["loss"],
             "train_mae": train_metrics["mae"],
             "train_rmse": train_metrics["rmse"],
@@ -1437,8 +1189,8 @@ def train_expanding_cv(cfg: TrainConfig, dataset: CamelsWindowDataset, device: t
         cfg.output_dir / "metrics.json",
         {
             "split_strategy": "expanding_cv",
-            "cv_num_folds": cfg.cv_num_folds,
-            "cv_train_ratio": cfg.cv_train_ratio,
+            "cv_num_folds": CV_NUM_FOLDS,
+            "cv_train_ratio": CV_TRAIN_RATIO,
             "cv_results": cv_results,
             "cv_mean_val_nse": float(np.mean([r["best_val_nse"] for r in cv_results])),
             "cv_mean_val_median_nse": float(np.mean([r["best_val_median_nse"] for r in cv_results])),
@@ -1463,70 +1215,6 @@ def train_expanding_cv(cfg: TrainConfig, dataset: CamelsWindowDataset, device: t
 
 def save_json(path: Path, payload: Dict) -> None:
     path.write_text(json.dumps(payload, indent=2, default=str) + "\n")
-
-
-def plot_training_curves(
-    history: Sequence[Dict[str, float]],
-    output_path: Path,
-    loss_label: str = "Loss",
-) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print(
-            "matplotlib is not installed; skipped saving training curve.",
-            flush=True,
-        )
-        return
-
-    epochs = [item["epoch"] for item in history]
-    train_loss = [item["train_loss"] for item in history]
-    val_loss = [item["val_loss"] for item in history]
-    train_mae = [item["train_mae"] for item in history]
-    val_mae = [item["val_mae"] for item in history]
-    train_rmse = [item["train_rmse"] for item in history]
-    val_rmse = [item["val_rmse"] for item in history]
-    train_nse = [item["train_nse"] for item in history]
-    val_nse = [item["val_nse"] for item in history]
-
-    fig, axes = plt.subplots(1, 4, figsize=(20, 4))
-
-    axes[0].plot(epochs, train_loss, label="Train Loss", linewidth=2)
-    axes[0].plot(epochs, val_loss, label="Val Loss", linewidth=2)
-    axes[0].set_title(loss_label)
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel(loss_label)
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    axes[1].plot(epochs, train_mae, label="Train MAE", linewidth=2)
-    axes[1].plot(epochs, val_mae, label="Val MAE", linewidth=2)
-    axes[1].set_title("MAE")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("MAE")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    axes[2].plot(epochs, train_rmse, label="Train RMSE", linewidth=2)
-    axes[2].plot(epochs, val_rmse, label="Val RMSE", linewidth=2)
-    axes[2].set_title("RMSE")
-    axes[2].set_xlabel("Epoch")
-    axes[2].set_ylabel("RMSE")
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
-
-    axes[3].plot(epochs, train_nse, label="Train NSE", linewidth=2)
-    axes[3].plot(epochs, val_nse, label="Val NSE", linewidth=2)
-    axes[3].set_title("NSE")
-    axes[3].set_xlabel("Epoch")
-    axes[3].set_ylabel("NSE")
-    axes[3].grid(True, alpha=0.3)
-    axes[3].legend()
-
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved training curve to: {output_path}", flush=True)
 
 
 def config_to_dict(cfg: TrainConfig) -> Dict:
@@ -1692,6 +1380,9 @@ def dataset_matches_config(cfg: TrainConfig) -> Tuple[bool, str]:
     except Exception as exc:
         return False, f"failed to read metadata: {exc}"
 
+    if "negative_target_rows_dropped" not in metadata:
+        return False, "dataset predates negative runoff target filtering"
+
     current = normalized_data_prep_signature(
         data_prep_config_to_dict(build_data_prep_config(cfg))
     )
@@ -1763,9 +1454,6 @@ def build_config_from_sources(config_path: Path, cli_args: argparse.Namespace) -
         "max_windows": file_config.get("max_windows", None),
         "write_flat_files": file_config.get("write_flat_files", False),
         "rebuild_dataset": file_config.get("rebuild_dataset", False),
-        "loss_name": file_config.get("loss_name", "mse"),
-        "mse_warmup_epochs": file_config.get("mse_warmup_epochs", 0),
-        "mse_weight": file_config.get("mse_weight", 0.5),
         "batch_size": file_config.get("batch_size", 64),
         "epochs": file_config.get("epochs", 30),
         "early_stopping_patience": file_config.get("early_stopping_patience", 8),
@@ -1773,22 +1461,14 @@ def build_config_from_sources(config_path: Path, cli_args: argparse.Namespace) -
         "lr": file_config.get("lr", 1e-3),
         "weight_decay": file_config.get("weight_decay", 1e-4),
         "grad_clip": file_config.get("grad_clip", 1.0),
-        "warmup_epochs": file_config.get("warmup_epochs", 0),
-        "warmup_start_factor": file_config.get("warmup_start_factor", 0.1),
-        "split_strategy": file_config.get("split_strategy", "ratio"),
-        "cv_num_folds": file_config.get("cv_num_folds", 4),
-        "cv_train_ratio": file_config.get("cv_train_ratio", 0.8),
-        "train_ratio": file_config.get("train_ratio", 0.7),
-        "val_ratio": file_config.get("val_ratio", 0.15),
-        "test_ratio": file_config.get("test_ratio", 0.15),
         "random_seed": file_config.get("random_seed", 42),
         "num_workers": file_config.get("num_workers", 0),
-        "model_name": file_config.get("model_name", "tft"),
         "d_model": file_config.get("d_model", 64),
         "lstm_hidden": file_config.get("lstm_hidden", 64),
         "n_heads": file_config.get("n_heads", 4),
         "dropout": file_config.get("dropout", 0.1),
         "prediction_length": file_config.get("prediction_length", 1),
+        "model_name": file_config.get("model_name", "tft"),
     }
 
     for key, value in vars(cli_args).items():
@@ -1802,7 +1482,7 @@ def build_config_from_sources(config_path: Path, cli_args: argparse.Namespace) -
     return TrainConfig(**merged)
 
 
-def train(cfg: TrainConfig, trial: Optional[Any] = None) -> Dict[str, object]:
+def train(cfg: TrainConfig) -> Dict[str, object]:
     set_seed(cfg.random_seed)
     ensure_dataset_prepared(cfg)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -1819,86 +1499,11 @@ def train(cfg: TrainConfig, trial: Optional[Any] = None) -> Dict[str, object]:
             f"Dataset target_transform {dataset.target_transform!r} does not match "
             f"{EXPECTED_TARGET_TRANSFORM!r}; rebuild is required."
         )
-    if cfg.split_strategy.lower() == "expanding_cv":
-        print(f"Using device: {device}", flush=True)
-        print(f"Loaded dataset from: {cfg.data_path}", flush=True)
-        print(f"Model: {cfg.model_name}", flush=True)
-        print(f"Training loss: {cfg.loss_name.upper()}", flush=True)
-        print(
-            f"Decoder future-known features: {dataset.future_known_feature_columns or 'none'}",
-            flush=True,
-        )
-        print(
-            f"Static attributes ({dataset.num_static_features}): {dataset.static_feature_columns or 'none'}",
-            flush=True,
-        )
-        print(
-            f"Dataset shapes: features={tuple(dataset.features.shape)}, targets={tuple(dataset.targets.shape)}, "
-            f"windows={len(dataset)} features_per_step={dataset.num_features}",
-            flush=True,
-        )
-        return train_expanding_cv(cfg, dataset, device)
-    if cfg.split_strategy.lower() != "ratio":
-        raise ValueError(
-            f"Unsupported split_strategy={cfg.split_strategy!r}. Expected 'ratio' or 'expanding_cv'."
-        )
-
-    model = build_model(dataset, cfg).to(device)
-    criterion = build_criterion(cfg)
-    mse_warmup_criterion = nn.MSELoss()
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=3,
-    )
-    if cfg.warmup_epochs > 0:
-        if not 0.0 < cfg.warmup_start_factor <= 1.0:
-            raise ValueError(
-                f"warmup_start_factor must be in (0, 1], got {cfg.warmup_start_factor}"
-            )
-        warmup_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = (
-            torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=cfg.warmup_start_factor,
-                end_factor=1.0,
-                total_iters=cfg.warmup_epochs,
-            )
-        )
-        print(
-            f"LR warmup: linear from {cfg.lr * cfg.warmup_start_factor:.2e} to "
-            f"{cfg.lr:.2e} over {cfg.warmup_epochs} epochs.",
-            flush=True,
-        )
-    else:
-        warmup_scheduler = None
-
-    train_idx, val_idx, test_idx = temporal_split_indices(dataset, cfg)
-    train_loader = make_loader(
-        dataset, train_idx, cfg.batch_size, True, cfg.num_workers, device
-    )
-    val_loader = make_loader(
-        dataset, val_idx, cfg.batch_size, False, cfg.num_workers, device
-    )
-    test_loader = make_loader(
-        dataset, test_idx, cfg.batch_size, False, cfg.num_workers, device
-    )
 
     print(f"Using device: {device}", flush=True)
     print(f"Loaded dataset from: {cfg.data_path}", flush=True)
     print(f"Model: {cfg.model_name}", flush=True)
-    print(f"Training loss: {cfg.loss_name.upper()}", flush=True)
-    if cfg.mse_warmup_epochs > 0 and cfg.loss_name.lower() != "mse":
-        print(
-            f"Loss warmup: using MSE for the first {cfg.mse_warmup_epochs} epochs, "
-            f"then {cfg.loss_name.upper()}.",
-            flush=True,
-        )
+    print("Training loss: Global NSE", flush=True)
     print(
         f"Decoder future-known features: {dataset.future_known_feature_columns or 'none'}",
         flush=True,
@@ -1908,305 +1513,11 @@ def train(cfg: TrainConfig, trial: Optional[Any] = None) -> Dict[str, object]:
         flush=True,
     )
     print(
-        f"Dataset format: {dataset.dataset_format}",
+        f"Dataset shapes: features={tuple(dataset.features.shape)}, targets={tuple(dataset.targets.shape)}, "
+        f"windows={len(dataset)} features_per_step={dataset.num_features}",
         flush=True,
     )
-    if dataset.mode == "dense":
-        print(
-            f"Dataset shapes: X={tuple(dataset.X.shape)}, y={tuple(dataset.y.shape)}, "
-            f"features={dataset.num_features}",
-            flush=True,
-        )
-    else:
-        print(
-            f"Dataset shapes: features={tuple(dataset.features.shape)}, targets={tuple(dataset.targets.shape)}, "
-            f"windows={len(dataset)} features_per_step={dataset.num_features}",
-            flush=True,
-        )
-    print(
-        f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, test={len(test_idx)}",
-        flush=True,
-    )
-
-    (
-        feature_mean_np,
-        feature_std_np,
-        target_mean_np,
-        target_std_np,
-        target_std_raw_np,
-    ) = compute_train_normalization_stats(dataset, train_idx)
-    feature_mean_tensor = torch.from_numpy(feature_mean_np).to(device)
-    feature_std_tensor = torch.from_numpy(feature_std_np).to(device)
-    target_mean_tensor = torch.from_numpy(target_mean_np).to(device)
-    target_std_tensor = torch.from_numpy(target_std_np).to(device)
-    target_std_raw_tensor = torch.from_numpy(target_std_raw_np).to(device)
-    if dataset.future_known_feature_indices is not None:
-        future_idx = torch.from_numpy(dataset.future_known_feature_indices).to(device=device, dtype=torch.long)
-        future_feature_mean_tensor = torch.index_select(feature_mean_tensor, dim=1, index=future_idx)
-        future_feature_std_tensor = torch.index_select(feature_std_tensor, dim=1, index=future_idx)
-    else:
-        future_feature_mean_tensor = None
-        future_feature_std_tensor = None
-
-    history: List[Dict[str, float]] = []
-    best_val_median_nse = float("-inf")  # Kratzert-style selection metric
-    best_val_nse = float("-inf")  # mean basin NSE, kept for reporting/fallback
-    best_val_loss = float("inf")  # kept for scheduler and final fallback
-    best_val_metrics: Optional[Dict[str, float]] = None
-    epochs_without_improvement = 0
-    best_checkpoint_path = cfg.output_dir / "best_model.pt"
-
-    for epoch in range(1, cfg.epochs + 1):
-        active_criterion = (
-            mse_warmup_criterion
-            if cfg.loss_name.lower() != "mse" and epoch <= cfg.mse_warmup_epochs
-            else criterion
-        )
-        train_metrics = run_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=active_criterion,
-            device=device,
-            optimizer=optimizer,
-            grad_clip=cfg.grad_clip,
-            feature_mean=feature_mean_tensor,
-            feature_std=feature_std_tensor,
-            future_feature_mean=future_feature_mean_tensor,
-            future_feature_std=future_feature_std_tensor,
-            target_mean=target_mean_tensor,
-            target_std=target_std_tensor,
-            target_std_raw=target_std_raw_tensor,
-        )
-        val_metrics = evaluate(
-            model,
-            val_loader,
-            criterion,
-            device,
-            feature_mean=feature_mean_tensor,
-            feature_std=feature_std_tensor,
-            future_feature_mean=future_feature_mean_tensor,
-            future_feature_std=future_feature_std_tensor,
-            target_mean=target_mean_tensor,
-            target_std=target_std_tensor,
-            target_std_raw=target_std_raw_tensor,
-        )
-        if warmup_scheduler is not None and epoch <= cfg.warmup_epochs:
-            warmup_scheduler.step()
-        else:
-            scheduler.step(val_metrics["loss"])
-
-        epoch_metrics = {
-            "epoch": epoch,
-            "loss_name": "mse_warmup" if active_criterion is mse_warmup_criterion else cfg.loss_name,
-            "train_loss": train_metrics["loss"],
-            "train_mae": train_metrics["mae"],
-            "train_rmse": train_metrics["rmse"],
-            "train_nse": train_metrics["nse"],
-            "train_median_nse": train_metrics["median_nse"],
-            "train_global_nse": train_metrics["global_nse"],
-            "train_mean_nse_loss": train_metrics["mean_nse_loss"],
-            "train_median_nse_loss": train_metrics["median_nse_loss"],
-            "train_global_nse_loss": train_metrics["global_nse_loss"],
-            "val_loss": val_metrics["loss"],
-            "val_mae": val_metrics["mae"],
-            "val_rmse": val_metrics["rmse"],
-            "val_nse": val_metrics["nse"],
-            "val_median_nse": val_metrics["median_nse"],
-            "val_global_nse": val_metrics["global_nse"],
-            "val_mean_nse_loss": val_metrics["mean_nse_loss"],
-            "val_median_nse_loss": val_metrics["median_nse_loss"],
-            "val_global_nse_loss": val_metrics["global_nse_loss"],
-            "lr": optimizer.param_groups[0]["lr"],
-        }
-        history.append(epoch_metrics)
-
-        print(
-            f"Epoch {epoch:03d} | "
-            f"train_loss={train_metrics['loss']:.6f} train_mae={train_metrics['mae']:.6f} train_rmse={train_metrics['rmse']:.6f} train_nse={train_metrics['nse']:.6f} train_median_nse={train_metrics['median_nse']:.6f} train_global_nse={train_metrics['global_nse']:.6f} | "
-            f"val_loss={val_metrics['loss']:.6f} val_mae={val_metrics['mae']:.6f} val_rmse={val_metrics['rmse']:.6f} val_nse={val_metrics['nse']:.6f} val_median_nse={val_metrics['median_nse']:.6f} val_global_nse={val_metrics['global_nse']:.6f}",
-            flush=True,
-        )
-
-        if trial is not None:
-            reported_value = val_metrics["median_nse"]
-            if math.isnan(reported_value):
-                reported_value = val_metrics["nse"]
-            if math.isnan(reported_value):
-                reported_value = -val_metrics["loss"]
-            trial.report(reported_value, step=epoch)
-            if trial.should_prune():
-                save_json(cfg.output_dir / "history.json", {"history": history})
-                save_json(
-                    cfg.output_dir / "metrics.json",
-                    {
-                        "status": "pruned",
-                        "pruned_epoch": epoch,
-                        "last_train_metrics": train_metrics,
-                        "last_val_metrics": val_metrics,
-                        "config": config_to_dict(cfg),
-                        "device": str(device),
-                    },
-                )
-                print(
-                    f"Trial pruned at epoch {epoch:03d} with val_median_nse={val_metrics['median_nse']:.6f}",
-                    flush=True,
-                )
-                try:
-                    import optuna
-                except ImportError as exc:  # pragma: no cover - runtime dependency
-                    raise RuntimeError(
-                        "Optuna trial pruning was requested but Optuna is not installed."
-                    ) from exc
-                raise optuna.TrialPruned(
-                    f"Pruned at epoch {epoch} with val_median_nse={val_metrics['median_nse']:.6f}"
-                )
-
-        val_median_nse_cur = val_metrics.get("median_nse", float("nan"))
-        val_nse_cur = val_metrics.get("nse", float("nan"))
-        val_loss_cur = val_metrics["loss"]
-        # Prefer median basin-wise validation NSE (Kratzert-style model selection).
-        if not math.isnan(val_median_nse_cur):
-            is_improved = val_median_nse_cur > best_val_median_nse + cfg.early_stopping_min_delta
-        elif not math.isnan(val_nse_cur):
-            is_improved = val_nse_cur > best_val_nse + cfg.early_stopping_min_delta
-        else:
-            is_improved = val_loss_cur < best_val_loss - cfg.early_stopping_min_delta
-
-        if is_improved:
-            if not math.isnan(val_median_nse_cur):
-                best_val_median_nse = val_median_nse_cur
-            if not math.isnan(val_nse_cur):
-                best_val_nse = val_nse_cur
-            best_val_loss = val_loss_cur
-            best_val_metrics = metrics_without_arrays(val_metrics)
-            epochs_without_improvement = 0
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "config": config_to_dict(cfg),
-                    "feature_columns": dataset.feature_columns,
-                    "static_feature_columns": dataset.static_feature_columns,
-                    "best_val_median_nse": best_val_median_nse,
-                    "best_val_nse": best_val_nse,
-                    "best_val_loss": best_val_loss,
-                },
-                best_checkpoint_path,
-            )
-        else:
-            epochs_without_improvement += 1
-
-        if epochs_without_improvement >= cfg.early_stopping_patience:
-            print(
-                f"Early stopping triggered at epoch {epoch:03d} after "
-                f"{cfg.early_stopping_patience} epochs without validation improvement.",
-                flush=True,
-            )
-            break
-
-    checkpoint = torch.load(best_checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics = evaluate(
-        model,
-        test_loader,
-        criterion,
-        device,
-        feature_mean=feature_mean_tensor,
-        feature_std=feature_std_tensor,
-        future_feature_mean=future_feature_mean_tensor,
-        future_feature_std=future_feature_std_tensor,
-        target_mean=target_mean_tensor,
-        target_std=target_std_tensor,
-        target_std_raw=target_std_raw_tensor,
-    )
-
-    print(
-        f"Best checkpoint test metrics | "
-            f"test_loss={test_metrics['loss']:.6f} test_mae={test_metrics['mae']:.6f} "
-            f"test_rmse={test_metrics['rmse']:.6f} test_nse={test_metrics['nse']:.6f} "
-            f"test_median_nse={test_metrics['median_nse']:.6f} "
-            f"test_global_nse={test_metrics['global_nse']:.6f}",
-            flush=True,
-        )
-
-    # Per-basin test NSE analysis — useful for spotting outlier basins dragging the average.
-    if "per_basin_nse" in test_metrics and dataset.basin_ids_in_model is not None:
-        per_basin_nse_np: np.ndarray = test_metrics["per_basin_nse"]
-        basin_id_list = list(dataset.basin_ids_in_model)
-        rows = [
-            {"basin_id": str(basin_id_list[i]), "test_nse": float(per_basin_nse_np[i])}
-            for i in range(len(basin_id_list))
-        ]
-        # Sort ascending by NSE (worst first); NaN basins go to the end.
-        rows.sort(key=lambda r: (math.isnan(r["test_nse"]), r["test_nse"]))
-        for rank, row in enumerate(rows, 1):
-            row["rank"] = rank
-        valid_nse_list = [r["test_nse"] for r in rows if not math.isnan(r["test_nse"])]
-        basin_summary: Dict[str, Any] = {
-            "n_basins": len(basin_id_list),
-            "n_valid": len(valid_nse_list),
-        }
-        if valid_nse_list:
-            arr_nse = np.array(valid_nse_list)
-            basin_summary.update({
-                "median_nse": float(np.median(arr_nse)),
-                "mean_nse": float(np.mean(arr_nse)),
-                "p10_nse": float(np.percentile(arr_nse, 10)),
-                "p25_nse": float(np.percentile(arr_nse, 25)),
-                "p75_nse": float(np.percentile(arr_nse, 75)),
-                "n_below_0": int(np.sum(arr_nse < 0)),
-                "n_below_0_5": int(np.sum(arr_nse < 0.5)),
-                "n_above_0_7": int(np.sum(arr_nse >= 0.7)),
-            })
-        basin_nse_path = cfg.output_dir / "basin_test_nse.json"
-        save_json(basin_nse_path, {"summary": basin_summary, "basins": rows})
-        print(f"Saved per-basin test NSE to: {basin_nse_path}", flush=True)
-        if valid_nse_list:
-            print(
-                f"  median={basin_summary['median_nse']:.3f}  "
-                f"p10={basin_summary['p10_nse']:.3f}  "
-                f"n_below_0.5={basin_summary['n_below_0_5']}/{len(valid_nse_list)}",
-                flush=True,
-            )
-
-    save_json(cfg.output_dir / "history.json", {"history": history})
-    save_json(
-        cfg.output_dir / "metrics.json",
-        {
-            "best_val_nse": best_val_nse,
-            "best_val_median_nse": best_val_median_nse,
-            "best_val_loss": best_val_loss,
-            "best_val_metrics": best_val_metrics,
-            "test_loss": test_metrics["loss"],
-            "test_mae": test_metrics["mae"],
-            "test_rmse": test_metrics["rmse"],
-            "test_nse": test_metrics["nse"],
-            "test_median_nse": test_metrics["median_nse"],
-            "test_global_nse": test_metrics["global_nse"],
-            "config": config_to_dict(cfg),
-            "device": str(device),
-        },
-    )
-    loss_name_lower = cfg.loss_name.lower()
-    if loss_name_lower == "nse":
-        loss_label = "Basin-averaged NSE* Loss"
-    elif loss_name_lower in {"global_nse", "global-nse"}:
-        loss_label = "Global NSE Loss"
-    elif loss_name_lower == "mixed":
-        loss_label = f"Mixed Loss ({cfg.mse_weight:.2f}·MSE + {1.0 - cfg.mse_weight:.2f}·NSE*)"
-    else:
-        loss_label = "MSE Loss"
-    plot_training_curves(history, cfg.output_dir / "training_curve.png", loss_label=loss_label)
-    return {
-        "best_val_nse": best_val_nse,
-        "best_val_median_nse": best_val_median_nse,
-        "best_val_loss": best_val_loss,
-        "best_val_metrics": best_val_metrics,
-        "test_metrics": test_metrics,
-        "history": history,
-        "output_dir": str(cfg.output_dir),
-        "device": str(device),
-    }
+    return train_expanding_cv(cfg, dataset, device)
 
 
 def parse_args() -> TrainConfig:
@@ -2217,80 +1528,7 @@ def parse_args() -> TrainConfig:
         default=DEFAULT_CONFIG_PATH,
         help="Path to the training config JSON file.",
     )
-    parser.add_argument("--data-dir", type=Path, default=None)
-    parser.add_argument("--processed-dir", type=Path, default=None)
-    parser.add_argument(
-        "--data-path",
-        type=Path,
-        default=None,
-        help="Path to the prepared CAMELS window dataset (.npz).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Directory to save checkpoints and metrics.",
-    )
-    parser.add_argument("--forcing-product", type=str, default=None)
-    parser.add_argument("--basin-id", action="append", default=None)
-    parser.add_argument("--start-date", type=str, default=None)
-    parser.add_argument("--end-date", type=str, default=None)
-    parser.add_argument("--target-unit", type=str, default=None)
-    parser.add_argument(
-        "--include-past-streamflow",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument("--lookback-days", type=int, default=None)
-    parser.add_argument("--forecast-horizon-days", type=int, default=None)
-    parser.add_argument("--stride-days", type=int, default=None)
-    parser.add_argument("--max-windows", type=int, default=None)
-    parser.add_argument("--loss-name", type=str, default=None)
-    parser.add_argument("--mse-warmup-epochs", type=int, default=None)
-    parser.add_argument("--mse-weight", type=float, default=None)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--early-stopping-patience", type=int, default=None)
-    parser.add_argument("--early-stopping-min-delta", type=float, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--weight-decay", type=float, default=None)
-    parser.add_argument("--grad-clip", type=float, default=None)
-    parser.add_argument("--warmup-epochs", type=int, default=None)
-    parser.add_argument("--warmup-start-factor", type=float, default=None)
-    parser.add_argument("--split-strategy", type=str, choices=["ratio", "expanding_cv"], default=None)
-    parser.add_argument("--cv-num-folds", type=int, default=None)
-    parser.add_argument("--cv-train-ratio", type=float, default=None)
-    parser.add_argument("--train-ratio", type=float, default=None)
-    parser.add_argument("--val-ratio", type=float, default=None)
-    parser.add_argument("--test-ratio", type=float, default=None)
-    parser.add_argument("--random-seed", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--model-name", type=str, choices=["tft", "lstm"], default=None)
-    parser.add_argument("--d-model", type=int, default=None)
-    parser.add_argument("--lstm-hidden", type=int, default=None)
-    parser.add_argument("--n-heads", type=int, default=None)
-    parser.add_argument("--dropout", type=float, default=None)
-    parser.add_argument("--prediction-length", type=int, default=None)
-    parser.add_argument(
-        "--allow-daymet-model-output-fallback",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--write-flat-files",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--rebuild-dataset",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-
     args = parser.parse_args()
-    if args.basin_id is not None:
-        args.basin_ids = args.basin_id
-        delattr(args, "basin_id")
     config_path = args.config
     if not config_path.is_absolute():
         config_path = PROJECT_DIR / config_path

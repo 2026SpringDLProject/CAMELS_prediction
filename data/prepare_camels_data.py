@@ -357,7 +357,7 @@ def process_basin_timeseries(
     basin_code: int,
     cfg: DataPrepConfig,
     forcing_feature_cols: Optional[List[str]] = None,
-) -> Tuple[Optional[Dict[str, np.ndarray]], List[str], List[str], str, int, int]:
+) -> Tuple[Optional[Dict[str, np.ndarray]], List[str], List[str], str, int, int, int]:
     rows_before = len(df)
     df = df.replace([-999, -999.0, -99, -99.0], np.nan)
 
@@ -374,9 +374,12 @@ def process_basin_timeseries(
         forcing_feature_cols = [c for c in forcing_feature_cols if c != "area_km2"]
 
     model_df = df.dropna(subset=forcing_feature_cols + [target_col]).copy()
+    negative_target_rows = int((model_df[target_col] < 0).sum())
+    if negative_target_rows > 0:
+        model_df = model_df[model_df[target_col] >= 0].copy()
     rows_after = len(model_df)
     if rows_after == 0:
-        return None, forcing_feature_cols, [], target_col, rows_before, rows_after
+        return None, forcing_feature_cols, [], target_col, rows_before, rows_after, negative_target_rows
 
     model_df = add_time_features(model_df)
     if cfg.include_past_streamflow:
@@ -394,7 +397,7 @@ def process_basin_timeseries(
         "targets": model_df[target_col].to_numpy(dtype=np.float32),
         "dates": model_df["date"].to_numpy(dtype="datetime64[D]"),
     }
-    return basin_payload, forcing_feature_cols, feature_cols, target_col, rows_before, rows_after
+    return basin_payload, forcing_feature_cols, feature_cols, target_col, rows_before, rows_after, negative_target_rows
 
 
 def build_indexed_dataset(
@@ -453,6 +456,7 @@ def build_indexed_dataset(
     total_rows = 0
     joined_rows_before_na = 0
     model_rows_after_na = 0
+    negative_target_rows_dropped = 0
     date_min: Optional[np.datetime64] = None
     date_max: Optional[np.datetime64] = None
 
@@ -481,6 +485,7 @@ def build_indexed_dataset(
                 target_col,
                 rows_before,
                 rows_after,
+                negative_rows,
             ) = process_basin_timeseries(
                 df=df,
                 basin_id=basin_id,
@@ -490,6 +495,7 @@ def build_indexed_dataset(
             )
             joined_rows_before_na += rows_before
             model_rows_after_na += rows_after
+            negative_target_rows_dropped += negative_rows
 
             if basin_payload is None:
                 if i % 50 == 0 or i == len(selected_basin_ids):
@@ -563,7 +569,7 @@ def build_indexed_dataset(
     )
 
     print(f"Joined rows before NA filtering: {joined_rows_before_na:,}", flush=True)
-    print(f"Model rows after NA filtering:   {model_rows_after_na:,}", flush=True)
+    print(f"Model rows after filtering:      {model_rows_after_na:,}", flush=True)
     print(f"Basins in model data:            {len(basins_in_model):,}", flush=True)
     print(f"Total windows before max_windows cap: {len(window_start):,}", flush=True)
     if date_min is not None and date_max is not None:
@@ -607,6 +613,12 @@ def build_indexed_dataset(
         print(
             f"Stratified per-basin subsample: kept {len(keep):,} of {before_count:,} "
             f"windows (target ≈{target_per_basin}/basin, max_windows={cfg.max_windows}).",
+            flush=True,
+        )
+
+    if negative_target_rows_dropped > 0:
+        print(
+            f"Dropped negative runoff rows:    {negative_target_rows_dropped:,}",
             flush=True,
         )
 
@@ -665,6 +677,7 @@ def build_indexed_dataset(
         "missing_basin_ids": missing,
         "joined_rows_before_na": joined_rows_before_na,
         "model_rows_after_na": model_rows_after_na,
+        "negative_target_rows_dropped": negative_target_rows_dropped,
         "basins_in_model": basins_in_model,
     }
     return dataset_payload, metadata
@@ -748,6 +761,11 @@ def load_camels_tables(
     forcing_feature_cols = [c for c in forcing_feature_cols if c != "area_km2"]
 
     model_df = joined_df.dropna(subset=forcing_feature_cols + [target_col]).copy()
+    negative_target_rows_dropped = int((model_df[target_col] < 0).sum())
+    if negative_target_rows_dropped > 0:
+        model_df = model_df[model_df[target_col] >= 0].copy()
+    if len(model_df) == 0:
+        raise ValueError("No model-ready rows remain after dropping NA and negative runoff targets.")
 
     model_df = add_time_features(model_df)
     if cfg.include_past_streamflow:
@@ -766,7 +784,12 @@ def load_camels_tables(
     )
 
     print(f"Joined rows before NA filtering: {len(joined_df):,}", flush=True)
-    print(f"Model rows after NA filtering:   {len(model_df):,}", flush=True)
+    print(f"Model rows after filtering:      {len(model_df):,}", flush=True)
+    if negative_target_rows_dropped > 0:
+        print(
+            f"Dropped negative runoff rows:    {negative_target_rows_dropped:,}",
+            flush=True,
+        )
     print(f"Basins in model data:            {model_df['basin_id'].nunique():,}", flush=True)
     print(
         f"Date range: {model_df['date'].min().date()} to {model_df['date'].max().date()}",
@@ -788,6 +811,7 @@ def load_camels_tables(
         "start_date": cfg.start_date,
         "end_date": cfg.end_date,
         "forcing_source_notes": forcing_source_notes,
+        "negative_target_rows_dropped": negative_target_rows_dropped,
     }
     debug_info = {
         "available_basin_ids": available_basin_ids,

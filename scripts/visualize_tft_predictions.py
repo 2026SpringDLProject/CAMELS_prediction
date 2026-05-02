@@ -20,28 +20,28 @@ from train import (  # noqa: E402
     build_model,
     compute_train_normalization_stats,
     denormalize_targets,
+    expanding_cv_split_indices,
     format_targets,
     make_loader,
     normalize_features,
     resolve_device,
-    temporal_split_indices,
 )
 
 PER_BASIN_NSE_YLIM = (-1.0, 1.5)
-PLOT_FONT_SIZE = 12
-PLOT_SMALL_FONT_SIZE = 11
-PLOT_LEGEND_FONT_SIZE = 12
+PLOT_FONT_SIZE = 14
+PLOT_SMALL_FONT_SIZE = 13
+PLOT_LEGEND_FONT_SIZE = 14
 
 
-def apply_plot_style(plt) -> None:
+def apply_plot_style(plt, font_bump: int = 0) -> None:
     plt.rcParams.update(
         {
-            "font.size": PLOT_FONT_SIZE,
-            "axes.labelsize": PLOT_FONT_SIZE,
-            "xtick.labelsize": PLOT_FONT_SIZE,
-            "ytick.labelsize": PLOT_FONT_SIZE,
-            "legend.fontsize": PLOT_LEGEND_FONT_SIZE,
-            "figure.titlesize": PLOT_FONT_SIZE,
+            "font.size": PLOT_FONT_SIZE + font_bump,
+            "axes.labelsize": PLOT_FONT_SIZE + font_bump,
+            "xtick.labelsize": PLOT_FONT_SIZE + font_bump,
+            "ytick.labelsize": PLOT_FONT_SIZE + font_bump,
+            "legend.fontsize": PLOT_LEGEND_FONT_SIZE + font_bump,
+            "figure.titlesize": PLOT_FONT_SIZE + font_bump,
         }
     )
 
@@ -87,6 +87,27 @@ def per_basin_nse(
         rows.append({"basin_slot": slot, "basin_id": basin_id, "nse": score})
     rows.sort(key=lambda row: row["nse"])
     return scores, rows
+
+
+def clipped_per_basin_nse(
+    per_basin_scores: np.ndarray,
+) -> Tuple[np.ndarray, float, float, int, int]:
+    finite_scores = per_basin_scores[np.isfinite(per_basin_scores)]
+    if finite_scores.size == 0:
+        return finite_scores, float("nan"), float("nan"), 0, 0
+
+    # NSE can have very large negative outliers. Use one shared clipped display
+    # range for the histogram, boxplot, and any metrics reported with that plot.
+    x_min = max(float(np.percentile(finite_scores, 2)), -1.0)
+    x_max = min(float(np.percentile(finite_scores, 98)), 1.0)
+    if x_max <= x_min:
+        x_min = min(float(np.min(finite_scores)), -1.0)
+        x_max = max(float(np.max(finite_scores)), 1.0)
+
+    n_below = int(np.sum(finite_scores < x_min))
+    n_above = int(np.sum(finite_scores > x_max))
+    clipped_scores = np.clip(finite_scores, x_min, x_max)
+    return clipped_scores, x_min, x_max, n_below, n_above
 
 
 def collect_predictions(
@@ -425,7 +446,7 @@ def plot_predictions(
 
     metrics = global_metrics(true, pred)
     residuals = pred - true
-    finite_scores = per_basin_scores[np.isfinite(per_basin_scores)]
+    clipped_scores, _, _, _, _ = clipped_per_basin_nse(per_basin_scores)
     n_plot = min(n_plot, len(true))
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -460,10 +481,10 @@ def plot_predictions(
     axes[1, 1].grid(True, alpha=0.3)
 
     score_text = "Per-basin NSE: n/a"
-    if finite_scores.size:
+    if clipped_scores.size:
         score_text = (
-            f"Per-basin NSE median={np.median(finite_scores):.3f}, "
-            f"mean={np.mean(finite_scores):.3f}, p10={np.percentile(finite_scores, 10):.3f}"
+            f"Clipped per-basin NSE median={np.median(clipped_scores):.3f}, "
+            f"mean={np.mean(clipped_scores):.3f}, p10={np.percentile(clipped_scores, 10):.3f}"
         )
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -538,7 +559,7 @@ def plot_best_worst_basin_panels(
     except ImportError:
         print("matplotlib is not installed; skipped best/worst basin panels.", flush=True)
         return
-    apply_plot_style(plt)
+    apply_plot_style(plt, font_bump=4)
 
     finite_rows = [row for row in per_basin_rows if math.isfinite(float(row["nse"]))]
     if not finite_rows:
@@ -575,7 +596,7 @@ def plot_best_worst_basin_panels(
             transform=ax.transAxes,
             va="top",
             ha="left",
-            fontsize=PLOT_FONT_SIZE,
+            fontsize=PLOT_FONT_SIZE + 4,
             bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "none", "pad": 2},
         )
         ax.set_ylabel("Runoff")
@@ -600,23 +621,17 @@ def plot_per_basin_nse_distribution(
     except ImportError:
         print("matplotlib is not installed; skipped per-basin NSE distribution.", flush=True)
         return
-    apply_plot_style(plt)
+    apply_plot_style(plt, font_bump=1)
 
     finite_scores = per_basin_scores[np.isfinite(per_basin_scores)]
     if finite_scores.size == 0:
         print("No finite per-basin NSE values; skipped NSE distribution plot.", flush=True)
         return
-
-    # NSE can have very large negative outliers. Show the useful skill range while
-    # preserving how many basins fall below the plotted lower edge.
-    x_min = max(float(np.percentile(finite_scores, 2)), -1.0)
-    x_max = min(float(np.percentile(finite_scores, 98)), 1.0)
-    if x_max <= x_min:
-        x_min = min(float(np.min(finite_scores)), -1.0)
-        x_max = max(float(np.max(finite_scores)), 1.0)
-    clipped_scores = np.clip(finite_scores, x_min, x_max)
+    # Fixed [-1, 1] display range so distributions are directly comparable across models.
+    x_min, x_max = -1.0, 1.0
     n_below = int(np.sum(finite_scores < x_min))
     n_above = int(np.sum(finite_scores > x_max))
+    clipped_scores = np.clip(finite_scores, x_min, x_max)
 
     fig, axes = plt.subplots(
         2,
@@ -625,14 +640,12 @@ def plot_per_basin_nse_distribution(
         sharex=True,
         gridspec_kw={"height_ratios": [1, 4]},
     )
-    bins = min(60, max(15, int(np.sqrt(finite_scores.size))))
+    bins = min(60, max(15, int(np.sqrt(clipped_scores.size))))
     axes[1].hist(clipped_scores, bins=bins, range=(x_min, x_max), color="#4C78A8", alpha=0.8)
-    median_score = float(np.median(finite_scores))
-    mean_score = float(np.mean(finite_scores))
-    if x_min <= median_score <= x_max:
-        axes[1].axvline(median_score, color="black", linestyle="--", linewidth=1, label="Median")
-    if x_min <= mean_score <= x_max:
-        axes[1].axvline(mean_score, color="#B54A4A", linestyle=":", linewidth=1.5, label="Mean")
+    median_score = float(np.median(clipped_scores))
+    mean_score = float(np.mean(clipped_scores))
+    axes[1].axvline(median_score, color="black", linestyle="--", linewidth=1, label="Median")
+    axes[1].axvline(mean_score, color="#B54A4A", linestyle=":", linewidth=1.5, label="Mean")
     if n_below or n_above:
         axes[1].text(
             0.02,
@@ -641,19 +654,26 @@ def plot_per_basin_nse_distribution(
             transform=axes[1].transAxes,
             va="top",
             ha="left",
-            fontsize=PLOT_SMALL_FONT_SIZE,
+            fontsize=PLOT_SMALL_FONT_SIZE + 1,
         )
-    axes[1].set_xlim(x_min, x_max)
     axes[1].set_xlabel("Per-basin NSE")
     axes[1].set_ylabel("Basin count")
     if axes[1].get_legend_handles_labels()[0]:
-        axes[1].legend()
+        axes[1].legend(loc="upper right")
     axes[1].grid(True, alpha=0.3)
 
-    axes[0].boxplot(finite_scores, vert=False, showfliers=False)
+    # whis=(0, 100): whiskers extend to actual data min/max (after clipping to [-1, 1]),
+    # so the box plot's horizontal extent matches the histogram's instead of stopping
+    # at Q1-1.5·IQR / Q3+1.5·IQR and hiding the clipped tail.
+    axes[0].boxplot(clipped_scores, vert=False, showfliers=False, whis=(0, 100))
     axes[0].set_yticks([1])
     axes[0].set_yticklabels(["Basins"])
     axes[0].grid(True, axis="x", alpha=0.3)
+
+    # Enforce the shared x range AFTER all data is drawn so the boxplot's
+    # autoscale margin doesn't widen the histogram axis (sharex=True).
+    axes[0].set_xlim(x_min, x_max)
+    axes[1].set_xlim(x_min, x_max)
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -677,14 +697,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def loss_label_from_config(cfg) -> str:
-    loss_name_lower = cfg.loss_name.lower()
-    if loss_name_lower == "nse":
-        return "Basin-averaged NSE* Loss"
-    if loss_name_lower in {"global_nse", "global-nse"}:
-        return "Global NSE Loss"
-    if loss_name_lower == "mixed":
-        return f"Mixed Loss ({cfg.mse_weight:.2f} MSE + {1.0 - cfg.mse_weight:.2f} NSE*)"
-    return "MSE Loss"
+    return "Global NSE Loss"
 
 
 def plot_cv_training_curves(
@@ -801,9 +814,11 @@ def main() -> None:
             setattr(cfg, key, checkpoint_config[key])
 
     dataset = CamelsWindowDataset(cfg.data_path)
-    train_idx, val_idx, test_idx = temporal_split_indices(dataset, cfg)
+    folds, pre_holdout_idx, holdout_idx = expanding_cv_split_indices(dataset, cfg)
+    val_idx = folds[-1]["val_idx"] if folds else np.empty(0, dtype=np.int64)
+    test_idx = holdout_idx
     feature_mean_np, feature_std_np, target_mean_np, target_std_np, _ = compute_train_normalization_stats(
-        dataset, train_idx
+        dataset, pre_holdout_idx
     )
 
     feature_mean = torch.from_numpy(feature_mean_np).to(device)
@@ -820,7 +835,7 @@ def main() -> None:
 
     model = build_model(dataset, cfg).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
-    model_label = cfg.model_name.upper()
+    model_label = getattr(cfg, "model_name", "tft").upper()
     print(f"Loaded checkpoint: {checkpoint_path}", flush=True)
     print(f"Using device: {device}", flush=True)
 
@@ -828,8 +843,21 @@ def main() -> None:
     batch_size = args.batch_size or cfg.batch_size
     basin_ids = dataset.basin_ids_in_model.tolist() if dataset.basin_ids_in_model is not None else None
     static_values, static_columns, static_scale_label = static_attribute_values(dataset, cfg.processed_dir)
+    print(
+        f"Split: pre_holdout={len(pre_holdout_idx)} windows used for normalization | "
+        f"test=holdout={len(holdout_idx)} windows | "
+        f"val=last_fold_val={len(val_idx)} windows",
+        flush=True,
+    )
 
     for split_name in args.splits:
+        if split_name == "val":
+            print(
+                "Warning: 'val' uses the last CV fold's val windows, which were "
+                "part of pre_holdout and were seen by the final model during retraining. "
+                "Use 'test' for held-out evaluation.",
+                flush=True,
+            )
         loader = make_loader(dataset, split_map[split_name], batch_size, False, cfg.num_workers, device)
         predictions = collect_predictions(
             model,
@@ -848,14 +876,15 @@ def main() -> None:
         dates = predictions.get("target_date")
         scores, rows = per_basin_nse(true, pred, basin_slots, basin_ids)
         metrics = global_metrics(true, pred)
-        finite_scores = scores[np.isfinite(scores)]
-        mean_basin_nse = float(np.mean(finite_scores)) if finite_scores.size else float("nan")
-        median_basin_nse = float(np.median(finite_scores)) if finite_scores.size else float("nan")
+        clipped_scores, _, _, _, _ = clipped_per_basin_nse(scores)
+        mean_basin_nse = float(np.mean(clipped_scores)) if clipped_scores.size else float("nan")
+        median_basin_nse = float(np.median(clipped_scores)) if clipped_scores.size else float("nan")
         print(
             f"{split_name.upper()} performance | "
             f"RMSE={metrics['rmse']:.4f} MAE={metrics['mae']:.4f} "
             f"R2={metrics['r2']:.4f} NSE={metrics['nse']:.4f} "
-            f"mean_basin_NSE={mean_basin_nse:.4f} median_basin_NSE={median_basin_nse:.4f}",
+            f"clipped_mean_basin_NSE={mean_basin_nse:.4f} "
+            f"clipped_median_basin_NSE={median_basin_nse:.4f}",
             flush=True,
         )
 
