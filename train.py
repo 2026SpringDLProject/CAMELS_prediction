@@ -138,59 +138,26 @@ class CamelsWindowDataset(Dataset):
             self.y = torch.from_numpy(y).float()
             self.num_features = self.X.shape[-1]
             self.prediction_length = self.y.shape[-1]
-
-            if self.X.ndim != 3:
-                raise ValueError(f"Expected X to have shape [N, T, F], got {tuple(self.X.shape)}")
-            if self.y.ndim != 2:
-                raise ValueError(f"Expected y to have shape [N, H], got {tuple(self.y.shape)}")
-            if len(self.X) != len(self.y):
-                raise ValueError("X and y must contain the same number of samples")
             return
 
-        if "features" in data.files and "window_start" in data.files:
-            self.mode = "indexed"
-            self.features = np.asarray(data["features"], dtype=np.float32)
-            self.targets = np.asarray(data["targets"], dtype=np.float32)
-            self.window_start = np.asarray(data["window_start"], dtype=np.int64)
-            self.lookback_days = int(np.asarray(data["lookback_days"]).reshape(-1)[0])
-            self.forecast_horizon_days = int(
-                np.asarray(data["forecast_horizon_days"]).reshape(-1)[0]
-            )
-            self.prediction_length = int(np.asarray(data["prediction_length"]).reshape(-1)[0])
-            self.window_basin_index = (
-                np.asarray(data["window_basin_index"], dtype=np.int64)
-                if "window_basin_index" in data.files
-                else None
-            )
-            self.basin_ids_in_model = (
-                data["basin_ids_in_model"] if "basin_ids_in_model" in data.files else None
-            )
-            self.num_features = self.features.shape[-1]
-            if (
-                self.num_static_features > 0
-                and self.basin_ids_in_model is not None
-                and self.static_features.shape[0] != len(self.basin_ids_in_model)
-            ):
-                raise ValueError(
-                    "static_features row count must match basin_ids_in_model length; "
-                    f"got {self.static_features.shape[0]} and {len(self.basin_ids_in_model)}"
-                )
-
-            if self.features.ndim != 2:
-                raise ValueError(
-                    f"Expected flat features to have shape [num_rows, num_features], got {tuple(self.features.shape)}"
-                )
-            if self.targets.ndim != 1:
-                raise ValueError(
-                    f"Expected flat targets to have shape [num_rows], got {tuple(self.targets.shape)}"
-                )
-            if len(self.window_start) == 0:
-                raise ValueError("Indexed dataset contains zero windows")
-            return
-
-        raise ValueError(
-            f"Unsupported dataset format in {npz_path}. Expected keys for dense or indexed dataset."
+        self.mode = "indexed"
+        self.features = np.asarray(data["features"], dtype=np.float32)
+        self.targets = np.asarray(data["targets"], dtype=np.float32)
+        self.window_start = np.asarray(data["window_start"], dtype=np.int64)
+        self.lookback_days = int(np.asarray(data["lookback_days"]).reshape(-1)[0])
+        self.forecast_horizon_days = int(
+            np.asarray(data["forecast_horizon_days"]).reshape(-1)[0]
         )
+        self.prediction_length = int(np.asarray(data["prediction_length"]).reshape(-1)[0])
+        self.window_basin_index = (
+            np.asarray(data["window_basin_index"], dtype=np.int64)
+            if "window_basin_index" in data.files
+            else None
+        )
+        self.basin_ids_in_model = (
+            data["basin_ids_in_model"] if "basin_ids_in_model" in data.files else None
+        )
+        self.num_features = self.features.shape[-1]
 
     def __len__(self) -> int:
         if self.mode == "dense":
@@ -315,13 +282,6 @@ def compute_train_normalization_stats(
     target_*_log are stats of log1p(target) used for input normalization.
     target_std_raw is std of raw mm/day target — used as the NSE* denominator.
     """
-    if dataset.mode != "indexed":
-        raise ValueError("Train-only normalization stats require an indexed dataset.")
-    if dataset.window_basin_index is None or dataset.row_basin_index is None or dataset.row_date is None:
-        raise ValueError("Dataset is missing row/window basin indices required for train-only normalization.")
-    if dataset.basin_ids_in_model is None:
-        raise ValueError("Dataset is missing basin_ids_in_model required for train-only normalization.")
-
     n_basins = len(dataset.basin_ids_in_model)
     n_features = dataset.num_features
     feature_mean = np.zeros((n_basins, n_features), dtype=np.float32)
@@ -333,8 +293,6 @@ def compute_train_normalization_stats(
     row_dates = np.asarray(dataset.row_date).astype("datetime64[D]")
     target_dates = np.asarray(dataset.target_date).astype("datetime64[D]")
     train_target_dates = target_dates[train_idx]
-    if len(train_target_dates) == 0:
-        raise ValueError("Training split is empty; cannot compute normalization statistics.")
 
     global_cutoff = train_target_dates.max()
     train_window_basin = dataset.window_basin_index[train_idx]
@@ -342,22 +300,10 @@ def compute_train_normalization_stats(
 
     for basin_slot in range(n_basins):
         basin_mask = train_window_basin == basin_slot
-        if np.any(basin_mask):
-            basin_cutoffs[basin_slot] = train_target_dates[basin_mask].max()
-        else:
-            raise ValueError(
-                f"Basin slot {basin_slot} has no training windows; cannot compute "
-                "train-only normalization stats without leaking val/test data."
-            )
+        basin_cutoffs[basin_slot] = train_target_dates[basin_mask].max()
 
     for basin_slot in range(n_basins):
         row_mask = (dataset.row_basin_index == basin_slot) & (row_dates <= basin_cutoffs[basin_slot])
-        if not np.any(row_mask):
-            raise ValueError(
-                f"Basin slot {basin_slot} has no training rows up to its cutoff "
-                f"{basin_cutoffs[basin_slot]}; cannot compute normalization stats."
-            )
-
         basin_features = dataset.features[row_mask]
         if dataset.normalize_feature_indices.size > 0:
             block = basin_features[:, dataset.normalize_feature_indices]
@@ -402,12 +348,7 @@ def resolve_device() -> torch.device:
 
 
 def infer_num_basins(X: torch.Tensor, basin_idx: int) -> int:
-    basin_codes = X[:, :, basin_idx].round().long()
-    first_step_codes = basin_codes[:, 0]
-    if not torch.equal(basin_codes, first_step_codes.unsqueeze(1).expand_as(basin_codes)):
-        raise ValueError("Found a window whose basin_code changes across time steps")
-    if torch.any(first_step_codes < 0):
-        raise ValueError("basin_code must be non-negative")
+    first_step_codes = X[:, 0, basin_idx].round().long()
     return int(first_step_codes.max().item()) + 1
 
 
@@ -416,23 +357,13 @@ def infer_num_basins_from_dataset(dataset: CamelsWindowDataset, basin_idx: int) 
         return infer_num_basins(dataset.X, basin_idx)
 
     basin_codes = np.rint(dataset.features[:, basin_idx]).astype(np.int64)
-    if np.any(basin_codes < 0):
-        raise ValueError("basin_code must be non-negative")
     return int(basin_codes.max()) + 1
 
 
 def temporal_split_indices(
     dataset: CamelsWindowDataset, cfg: TrainConfig
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    total_ratio = TEMPORAL_TRAIN_RATIO + TEMPORAL_VAL_RATIO + TEMPORAL_TEST_RATIO
-    if not math.isclose(total_ratio, 1.0, rel_tol=1e-6, abs_tol=1e-6):
-        raise ValueError(
-            "train/val/test ratios must sum to 1.0"
-        )
-
     n_samples = len(dataset)
-    if n_samples < 3:
-        raise ValueError("Need at least 3 samples to build train/val/test splits")
 
     if dataset.target_date is not None:
         dates = np.asarray(dataset.target_date).astype("datetime64[D]")
@@ -448,9 +379,6 @@ def temporal_split_indices(
     val_idx = order[train_end:val_end]
     test_idx = order[val_end:]
 
-    if len(val_idx) == 0 or len(test_idx) == 0:
-        raise ValueError("Validation and test splits must both contain at least one sample")
-
     return train_idx, val_idx, test_idx
 
 
@@ -458,64 +386,26 @@ def expanding_cv_split_indices(
     dataset: CamelsWindowDataset,
     cfg: TrainConfig,
 ) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
-    if dataset.target_date is None:
-        raise ValueError("Expanding-window CV requires target_date in the prepared dataset.")
-    if dataset.window_basin_index is None:
-        raise ValueError(
-            "Per-basin expanding-window CV requires window_basin_index in the prepared dataset."
-        )
     dates = np.asarray(dataset.target_date).astype("datetime64[D]")
     basin_slots = np.asarray(dataset.window_basin_index, dtype=np.int64)
-    if len(dates) != len(basin_slots):
-        raise ValueError("target_date and window_basin_index must have the same length.")
-    if len(dates) < CV_NUM_FOLDS + 2:
-        raise ValueError("Not enough samples to build expanding-window CV splits.")
 
-    basin_ids = (
-        [str(value) for value in dataset.basin_ids_in_model]
-        if dataset.basin_ids_in_model is not None
-        else None
-    )
     basin_chunks: Dict[int, List[np.ndarray]] = {}
     pre_holdout_parts: List[np.ndarray] = []
     holdout_parts: List[np.ndarray] = []
-    skipped: List[str] = []
 
     for basin_slot in np.unique(basin_slots):
         basin_idx = np.flatnonzero(basin_slots == basin_slot)
         basin_order = basin_idx[np.argsort(dates[basin_idx], kind="stable")]
-        min_needed = CV_NUM_FOLDS + 2
-        label = (
-            basin_ids[int(basin_slot)]
-            if basin_ids is not None and int(basin_slot) < len(basin_ids)
-            else str(int(basin_slot))
-        )
-        if len(basin_order) < min_needed:
-            skipped.append(f"{label}({len(basin_order)} windows)")
-            continue
 
         pre_end = int(len(basin_order) * CV_TRAIN_RATIO)
         pre_end = max(CV_NUM_FOLDS + 1, min(len(basin_order) - 1, pre_end))
         basin_pre = basin_order[:pre_end]
         basin_holdout = basin_order[pre_end:]
         chunks = [chunk for chunk in np.array_split(basin_pre, CV_NUM_FOLDS + 1)]
-        if len(basin_holdout) == 0 or any(len(chunk) == 0 for chunk in chunks):
-            skipped.append(f"{label}({len(basin_order)} windows)")
-            continue
 
         basin_chunks[int(basin_slot)] = chunks
         pre_holdout_parts.append(basin_pre)
         holdout_parts.append(basin_holdout)
-
-    if skipped:
-        preview = ", ".join(skipped[:10])
-        suffix = "..." if len(skipped) > 10 else ""
-        raise ValueError(
-            "Some basins do not have enough windows for per-basin expanding-window CV: "
-            f"{preview}{suffix}. Use a denser window stride or a longer training period."
-        )
-    if not basin_chunks:
-        raise ValueError("No basins had enough samples to build expanding-window CV splits.")
 
     folds: List[Dict[str, Any]] = []
     for fold_id in range(CV_NUM_FOLDS):
@@ -777,11 +667,6 @@ def build_model(dataset: CamelsWindowDataset, cfg: TrainConfig) -> nn.Module:
 
     num_real_features = num_features - 1
     num_basins = infer_num_basins_from_dataset(dataset, basin_idx)
-
-    if dataset.prediction_length != cfg.prediction_length:
-        raise ValueError(
-            f"prediction_length={cfg.prediction_length} but dataset was prepared with prediction_length={dataset.prediction_length}"
-        )
 
     model_name = cfg.model_name.lower()
     if model_name in {"lstm", "lstm_baseline", "baseline"}:
@@ -1235,10 +1120,7 @@ def resolve_project_path(path_value: str) -> Path:
 
 def load_config_file(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Config file must contain a JSON object, got {type(payload).__name__}")
-    return payload
+        return json.load(f)
 
 
 def build_data_prep_config(cfg: TrainConfig) -> DataPrepConfig:
@@ -1295,93 +1177,44 @@ def dataset_matches_config(cfg: TrainConfig) -> Tuple[bool, str]:
     if not cfg.data_path.exists():
         return False, "dataset file does not exist"
 
-    try:
-        with np.load(cfg.data_path, allow_pickle=True) as data:
-            dataset_format = (
-                str(data["dataset_format"][0]) if "dataset_format" in data.files else ""
-            )
-            if dataset_format != EXPECTED_DATASET_FORMAT:
-                return False, f"dataset_format={dataset_format!r} does not match {EXPECTED_DATASET_FORMAT!r}"
-            target_transform = (
-                str(data["target_transform"][0]) if "target_transform" in data.files else ""
-            )
-            if target_transform != EXPECTED_TARGET_TRANSFORM:
-                return False, (
-                    f"target_transform={target_transform!r} does not match "
-                    f"{EXPECTED_TARGET_TRANSFORM!r}"
-                )
-            required_keys = (
-                "row_date",
-                "row_basin_index",
-                "window_basin_index",
-                "normalize_feature_indices",
-            )
-            missing_keys = [k for k in required_keys if k not in data.files]
-            if missing_keys:
-                return False, f"dataset missing required keys: {missing_keys}"
-            if "X" in data.files:
-                x = np.asarray(data["X"])
-                if x.ndim != 3:
-                    return False, f"expected X to have 3 dimensions, got {x.ndim}"
-                if x.shape[1] != cfg.lookback_days:
-                    return False, "lookback_days changed"
+    with np.load(cfg.data_path, allow_pickle=True) as data:
+        dataset_format = str(data["dataset_format"][0]) if "dataset_format" in data.files else ""
+        if dataset_format != EXPECTED_DATASET_FORMAT:
+            return False, f"dataset_format={dataset_format!r} does not match {EXPECTED_DATASET_FORMAT!r}"
+        target_transform = str(data["target_transform"][0]) if "target_transform" in data.files else ""
+        if target_transform != EXPECTED_TARGET_TRANSFORM:
+            return False, f"target_transform={target_transform!r} does not match {EXPECTED_TARGET_TRANSFORM!r}"
+        if "X" in data.files:
+            x = np.asarray(data["X"])
+            if x.shape[1] != cfg.lookback_days:
+                return False, "lookback_days changed"
+            y = np.asarray(data["y"])
+            prediction_length = y.shape[1] if y.ndim > 1 else 1
+        else:
+            lookback_days = int(np.asarray(data["lookback_days"]).reshape(-1)[0])
+            if lookback_days != cfg.lookback_days:
+                return False, "lookback_days changed"
+            prediction_length = int(np.asarray(data["prediction_length"]).reshape(-1)[0])
+            forecast_horizon_days = int(np.asarray(data["forecast_horizon_days"]).reshape(-1)[0])
+            if forecast_horizon_days != cfg.forecast_horizon_days:
+                return False, "forecast_horizon_days changed"
 
-                y = np.asarray(data["y"])
-                prediction_length = y.shape[1] if y.ndim > 1 else 1
-            elif "features" in data.files and "window_start" in data.files:
-                x = np.asarray(data["features"])
-                if x.ndim != 2:
-                    return False, f"expected flat features to have 2 dimensions, got {x.ndim}"
-                lookback_days = int(np.asarray(data["lookback_days"]).reshape(-1)[0])
-                if lookback_days != cfg.lookback_days:
-                    return False, "lookback_days changed"
-                prediction_length = int(np.asarray(data["prediction_length"]).reshape(-1)[0])
-                forecast_horizon_days = int(
-                    np.asarray(data["forecast_horizon_days"]).reshape(-1)[0]
-                )
-                if forecast_horizon_days != cfg.forecast_horizon_days:
-                    return False, "forecast_horizon_days changed"
-            else:
-                return False, "dataset format is not recognized"
+        if prediction_length != cfg.prediction_length:
+            return False, "prediction_length changed"
 
-            if prediction_length != cfg.prediction_length:
-                return False, "prediction_length changed"
-
-            feature_columns = data["feature_columns"].tolist() if "feature_columns" in data.files else []
-            if "basin_code" not in feature_columns:
-                return False, "dataset is missing basin_code feature"
-            if "doy_sin" not in feature_columns or "doy_cos" not in feature_columns:
-                return False, "dataset is missing day-of-year features"
-            has_past_streamflow = "past_streamflow" in feature_columns
-            if cfg.include_past_streamflow and not has_past_streamflow:
-                return False, "dataset is missing past_streamflow feature"
-            if not cfg.include_past_streamflow and has_past_streamflow:
-                return False, "dataset has past_streamflow feature but config disables it"
-            if "static_features" not in data.files or "static_feature_columns" not in data.files:
-                return False, "dataset is missing static attribute features"
-            static_features = np.asarray(data["static_features"])
-            static_feature_columns = data["static_feature_columns"].tolist()
-            if static_features.ndim != 2:
-                return False, f"expected static_features to have 2 dimensions, got {static_features.ndim}"
-            if static_features.shape[1] != len(static_feature_columns):
-                return False, "static_features width does not match static_feature_columns"
-            if len(static_feature_columns) == 0:
-                return False, "dataset has no static attribute columns"
-    except Exception as exc:
-        return False, f"failed to inspect dataset: {exc}"
+        feature_columns = data["feature_columns"].tolist() if "feature_columns" in data.files else []
+        has_past_streamflow = "past_streamflow" in feature_columns
+        if cfg.include_past_streamflow and not has_past_streamflow:
+            return False, "dataset is missing past_streamflow feature"
+        if not cfg.include_past_streamflow and has_past_streamflow:
+            return False, "dataset has past_streamflow feature but config disables it"
 
     metadata_path = cfg.processed_dir / "camels_transformer_metadata.json"
     if not metadata_path.exists():
         return False, "metadata file does not exist"
 
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        previous = metadata.get("data_prep_config", {})
-    except Exception as exc:
-        return False, f"failed to read metadata: {exc}"
-
-    if "negative_target_rows_dropped" not in metadata:
-        return False, "dataset predates negative runoff target filtering"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    previous = metadata.get("data_prep_config", {})
 
     current = normalized_data_prep_signature(
         data_prep_config_to_dict(build_data_prep_config(cfg))
@@ -1489,16 +1322,6 @@ def train(cfg: TrainConfig) -> Dict[str, object]:
     device = resolve_device()
 
     dataset = CamelsWindowDataset(cfg.data_path)
-    if dataset.dataset_format != EXPECTED_DATASET_FORMAT:
-        raise ValueError(
-            f"Dataset format {dataset.dataset_format!r} is not supported; expected "
-            f"{EXPECTED_DATASET_FORMAT!r}. Re-run data prep or set rebuild_dataset=true."
-        )
-    if dataset.target_transform != EXPECTED_TARGET_TRANSFORM:
-        raise ValueError(
-            f"Dataset target_transform {dataset.target_transform!r} does not match "
-            f"{EXPECTED_TARGET_TRANSFORM!r}; rebuild is required."
-        )
 
     print(f"Using device: {device}", flush=True)
     print(f"Loaded dataset from: {cfg.data_path}", flush=True)

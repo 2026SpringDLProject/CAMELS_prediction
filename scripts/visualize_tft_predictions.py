@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
@@ -133,10 +134,7 @@ def collect_predictions(
             y_raw = batch["y"].to(device)
             future_known = batch.get("future_known")
             static_features = batch.get("static")
-            basin_slot = batch.get("basin_slot")
-            if basin_slot is None:
-                raise ValueError("Prediction visualization requires basin_slot in the dataset.")
-            basin_slot = basin_slot.to(device)
+            basin_slot = batch.get("basin_slot").to(device)
             if static_features is not None:
                 static_features = static_features.to(device)
 
@@ -228,15 +226,11 @@ def static_attribute_values(
     if not metadata_path.exists():
         return values, columns, scale_label
 
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        static_metadata = metadata.get("static_attributes", {})
-        metadata_columns = list(static_metadata.get("columns", []))
-        mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
-        std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
-    except Exception as exc:
-        print(f"Could not read static attribute metadata ({exc}); using z-scored attributes.", flush=True)
-        return values, columns, scale_label
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    static_metadata = metadata.get("static_attributes", {})
+    metadata_columns = list(static_metadata.get("columns", []))
+    mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
+    std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
 
     if metadata_columns == columns and mean.shape[0] == values.shape[1] and std.shape[0] == values.shape[1]:
         return values * std + mean, columns, "raw"
@@ -387,11 +381,6 @@ def plot_static_attribute_relationships(
         print("No finite static attribute relationships; skipped NSE vs attribute plot.", flush=True)
         return
 
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped NSE vs static attribute plot.", flush=True)
-        return
     apply_plot_style(plt)
 
     col_index = {str(name): idx for idx, name in enumerate(static_columns)}
@@ -437,11 +426,6 @@ def plot_predictions(
     title: str,
     n_plot: int,
 ) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped prediction visualization.", flush=True)
-        return
     apply_plot_style(plt)
 
     metrics = global_metrics(true, pred)
@@ -514,11 +498,6 @@ def plot_single_basin_timeseries(
     basin_slot: int,
     basin_label: str,
 ) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped single-basin visualization.", flush=True)
-        return
     apply_plot_style(plt)
 
     mask = basin_slots == basin_slot
@@ -554,11 +533,6 @@ def plot_best_worst_basin_panels(
     per_basin_rows: Sequence[Dict[str, object]],
     n_each: int,
 ) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped best/worst basin panels.", flush=True)
-        return
     apply_plot_style(plt, font_bump=4)
 
     finite_rows = [row for row in per_basin_rows if math.isfinite(float(row["nse"]))]
@@ -616,11 +590,6 @@ def plot_per_basin_nse_distribution(
     per_basin_scores: np.ndarray,
     title: str,
 ) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped per-basin NSE distribution.", flush=True)
-        return
     apply_plot_style(plt, font_bump=1)
 
     finite_scores = per_basin_scores[np.isfinite(per_basin_scores)]
@@ -705,11 +674,6 @@ def plot_cv_training_curves(
     output_path: Path,
     loss_label: str,
 ) -> None:
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib is not installed; skipped saving CV training curve.", flush=True)
-        return
     apply_plot_style(plt)
 
     if not cv_histories:
@@ -766,12 +730,7 @@ def plot_cv_history_from_json(history_path: Path, output_dir: Path, cfg) -> bool
         print(f"History file not found; skipped CV training curve: {history_path}", flush=True)
         return False
 
-    try:
-        payload = json.loads(history_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"Could not read history file ({exc}); skipped CV training curve.", flush=True)
-        return False
-
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
     cv_histories = payload.get("cv_histories")
     if not cv_histories:
         print("history.json does not contain cv_histories; skipped CV training curve.", flush=True)
@@ -796,8 +755,6 @@ def main() -> None:
     )
     output_dir = checkpoint_path.parent
     plot_cv_history_from_json(output_dir / "history.json", output_dir, cfg)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     device = resolve_device()
     checkpoint = torch.load(checkpoint_path, map_location=device)

@@ -56,8 +56,6 @@ MODEL_COLORS: Dict[str, str] = {
 
 
 def load_predictions(name: str, path: Path) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"{name} predictions CSV not found: {path}")
     df = pd.read_csv(path, usecols=["basin_id", "target_date", "actual", "predicted"])
     df["basin_id"] = df["basin_id"].astype(str).str.zfill(8)
     df["target_date"] = pd.to_datetime(df["target_date"])

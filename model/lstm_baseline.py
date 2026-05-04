@@ -1,29 +1,11 @@
-import importlib.util
-from pathlib import Path
-
 import torch
 import torch.nn as nn
-
-try:
-    from utils.tftinput import TFTInput
-except ModuleNotFoundError:
-    PROJECT_DIR = Path(__file__).resolve().parents[1]
-    module_path = PROJECT_DIR / "utils" / "tftinput.py"
-    spec = importlib.util.spec_from_file_location("camels_tftinput", module_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    TFTInput = module.TFTInput
+from utils.tftinput import TFTInput
 
 
+# LSTM-only baseline that uses the same inputs and output contract as SimpleTFT,
+# but removes variable selection, self-attention, and gated residual blocks.
 class LSTMBaseline(nn.Module):
-    """LSTM-only baseline that uses the same inputs and output contract as SimpleTFT.
-
-    The baseline keeps basin/static conditioning and optional future-known decoder
-    inputs, but removes variable selection, self-attention, cross-attention, and
-    gated residual blocks. This makes it a useful architecture baseline under the
-    same training loop, loss functions, and metrics.
-    """
-
     def __init__(
         self,
         num_real_features,

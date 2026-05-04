@@ -182,9 +182,6 @@ def index_camels_zip(zip_path: Path, forcing_product: str = "nldas") -> CamelsPa
 
 
 def read_gauge_info(zip_path: Path, gauge_info_path: Optional[str]) -> pd.DataFrame:
-    if gauge_info_path is None:
-        raise FileNotFoundError("Could not find basin_metadata/gauge_information.txt in the archive.")
-
     with zipfile.ZipFile(zip_path) as zf:
         text = zf.read(gauge_info_path).decode("utf-8", errors="replace")
 
@@ -255,12 +252,6 @@ def load_static_attributes(
     groups: Sequence[str],
 ) -> Tuple[np.ndarray, List[str], Dict]:
     normalized_groups = [str(group).strip().lower() for group in groups]
-    unknown_groups = sorted(set(normalized_groups) - set(STATIC_ATTRIBUTE_COLUMNS))
-    if unknown_groups:
-        raise ValueError(
-            f"Unknown static attribute groups {unknown_groups}. "
-            f"Expected a subset of {sorted(STATIC_ATTRIBUTE_COLUMNS)}"
-        )
 
     static_df = pd.DataFrame({"gauge_id": [_normalise_basin_id(x) for x in basin_ids]})
     feature_cols: List[str] = []
@@ -268,9 +259,6 @@ def load_static_attributes(
 
     for group in normalized_groups:
         path = data_dir / f"camels_{group}.txt"
-        if not path.exists():
-            raise FileNotFoundError(f"Static attribute file not found: {path}")
-
         cols = list(STATIC_ATTRIBUTE_COLUMNS[group])
         group_df = pd.read_csv(
             path,
@@ -280,9 +268,6 @@ def load_static_attributes(
             keep_default_na=True,
         )
         group_df["gauge_id"] = group_df["gauge_id"].map(_normalise_basin_id)
-        missing_cols = [col for col in cols if col not in group_df.columns]
-        if missing_cols:
-            raise ValueError(f"{path.name} is missing expected columns: {missing_cols}")
 
         for col in cols:
             group_df[col] = pd.to_numeric(group_df[col], errors="coerce")
@@ -290,10 +275,6 @@ def load_static_attributes(
         static_df = static_df.merge(group_df[["gauge_id"] + cols], on="gauge_id", how="left")
         feature_cols.extend(cols)
         source_files[group] = str(path)
-
-    duplicate_cols = sorted({col for col in feature_cols if feature_cols.count(col) > 1})
-    if duplicate_cols:
-        raise ValueError(f"Duplicate static feature column names: {duplicate_cols}")
 
     if not feature_cols:
         return np.empty((len(basin_ids), 0), dtype=np.float32), [], {
@@ -340,15 +321,8 @@ def write_table(df: pd.DataFrame, path_base: Path) -> Dict[str, Optional[str]]:
     csv_path = path_base.with_suffix(".csv")
 
     df.to_csv(csv_path, index=False)
-    outputs: Dict[str, Optional[str]] = {"csv": str(csv_path), "parquet": None}
-
-    try:
-        df.to_parquet(parquet_path, index=False)
-        outputs["parquet"] = str(parquet_path)
-    except Exception as exc:
-        print(f"Parquet write failed for {parquet_path.name}: {exc}", flush=True)
-
-    return outputs
+    df.to_parquet(parquet_path, index=False)
+    return {"csv": str(csv_path), "parquet": str(parquet_path)}
 
 
 def process_basin_timeseries(
@@ -361,12 +335,7 @@ def process_basin_timeseries(
     rows_before = len(df)
     df = df.replace([-999, -999.0, -99, -99.0], np.nan)
 
-    if cfg.target_unit == "mm/day":
-        target_col = "QObs(mm/day)"
-    elif cfg.target_unit == "cfs":
-        target_col = "QObs(cfs)"
-    else:
-        raise ValueError("target_unit must be 'mm/day' or 'cfs'")
+    target_col = "QObs(mm/day)" if cfg.target_unit == "mm/day" else "QObs(cfs)"
 
     if forcing_feature_cols is None:
         base_non_feature_cols = {"basin_id", "date", "quality_flag", "QObs(cfs)", "QObs(mm/day)"}
@@ -405,13 +374,6 @@ def build_indexed_dataset(
 ) -> Tuple[Dict[str, np.ndarray], Dict]:
     forcing_zip, actual_forcing_product, forcing_source_notes = choose_forcing_source(cfg)
 
-    if not _is_readable_zip(cfg.timeseries_zip):
-        raise FileNotFoundError(
-            f"Main CAMELS time-series zip is missing or unreadable: {cfg.timeseries_zip}"
-        )
-    if not _is_readable_zip(forcing_zip):
-        raise FileNotFoundError(f"Forcing zip is missing or unreadable: {forcing_zip}")
-
     forcing_paths = index_camels_zip(forcing_zip, actual_forcing_product)
     target_paths = index_camels_zip(cfg.timeseries_zip, actual_forcing_product)
 
@@ -420,8 +382,6 @@ def build_indexed_dataset(
     selected_basin_ids = requested_basin_ids or available_basin_ids
     missing = sorted(set(selected_basin_ids) - set(available_basin_ids))
     selected_basin_ids = [b for b in selected_basin_ids if b in available_basin_ids]
-    if not selected_basin_ids:
-        raise ValueError("No basins available after filtering. Check basin_ids and input archives.")
 
     print(f"Forcing archive: {forcing_zip}", flush=True)
     print(f"Forcing product: {actual_forcing_product}", flush=True)
@@ -540,9 +500,6 @@ def build_indexed_dataset(
 
             if i % 50 == 0 or i == len(selected_basin_ids):
                 print(f"Loaded {i:>4}/{len(selected_basin_ids)} basins", flush=True)
-
-    if not feature_parts or feature_cols is None or target_col is None:
-        raise ValueError("No model-ready basin data was generated.")
 
     all_features = np.concatenate(feature_parts, axis=0).astype(np.float32, copy=False)
     all_targets = np.concatenate(target_parts, axis=0).astype(np.float32, copy=False)
@@ -688,13 +645,6 @@ def load_camels_tables(
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, List[str], str, Dict, Dict]:
     forcing_zip, actual_forcing_product, forcing_source_notes = choose_forcing_source(cfg)
 
-    if not _is_readable_zip(cfg.timeseries_zip):
-        raise FileNotFoundError(
-            f"Main CAMELS time-series zip is missing or unreadable: {cfg.timeseries_zip}"
-        )
-    if not _is_readable_zip(forcing_zip):
-        raise FileNotFoundError(f"Forcing zip is missing or unreadable: {forcing_zip}")
-
     forcing_paths = index_camels_zip(forcing_zip, actual_forcing_product)
     target_paths = index_camels_zip(cfg.timeseries_zip, actual_forcing_product)
 
@@ -703,8 +653,6 @@ def load_camels_tables(
     selected_basin_ids = requested_basin_ids or available_basin_ids
     missing = sorted(set(selected_basin_ids) - set(available_basin_ids))
     selected_basin_ids = [b for b in selected_basin_ids if b in available_basin_ids]
-    if not selected_basin_ids:
-        raise ValueError("No basins available after filtering. Check basin_ids and input archives.")
 
     print(f"Forcing archive: {forcing_zip}", flush=True)
     print(f"Forcing product: {actual_forcing_product}", flush=True)
@@ -749,12 +697,7 @@ def load_camels_tables(
     joined_df = joined_df.sort_values(["basin_id", "date"]).reset_index(drop=True)
     joined_df = joined_df.replace([-999, -999.0, -99, -99.0], np.nan)
 
-    if cfg.target_unit == "mm/day":
-        target_col = "QObs(mm/day)"
-    elif cfg.target_unit == "cfs":
-        target_col = "QObs(cfs)"
-    else:
-        raise ValueError("target_unit must be 'mm/day' or 'cfs'")
+    target_col = "QObs(mm/day)" if cfg.target_unit == "mm/day" else "QObs(cfs)"
 
     base_non_feature_cols = {"basin_id", "date", "quality_flag", "QObs(cfs)", "QObs(mm/day)"}
     forcing_feature_cols = [c for c in joined_df.columns if c not in base_non_feature_cols]
@@ -764,8 +707,6 @@ def load_camels_tables(
     negative_target_rows_dropped = int((model_df[target_col] < 0).sum())
     if negative_target_rows_dropped > 0:
         model_df = model_df[model_df[target_col] >= 0].copy()
-    if len(model_df) == 0:
-        raise ValueError("No model-ready rows remain after dropping NA and negative runoff targets.")
 
     model_df = add_time_features(model_df)
     if cfg.include_past_streamflow:
@@ -878,9 +819,6 @@ def build_window_dataset(
         y_all.extend(y)
         basin_all.extend(basins)
         date_all.extend(dates)
-
-    if not X_all:
-        raise ValueError("No sequence windows were created. Check dates and window parameters.")
 
     if cfg.max_windows is not None and len(X_all) > cfg.max_windows:
         rng = np.random.default_rng(cfg.random_seed)

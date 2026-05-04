@@ -136,12 +136,6 @@ class TemporalSummaryiTransformer(nn.Module):
 
     def forward(self, x_dynamic: torch.Tensor, basin_code: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, num_features = x_dynamic.shape
-        if seq_len != self.seq_len:
-            raise ValueError(f"Expected seq_len={self.seq_len}, got {seq_len}")
-        if num_features != self.num_dynamic_features:
-            raise ValueError(
-                f"Expected num_dynamic_features={self.num_dynamic_features}, got {num_features}"
-            )
 
         x = x_dynamic.transpose(1, 2)
         x_aug = torch.cat(
@@ -228,12 +222,7 @@ def read_joined_table(data_dir: Path, config: Dict, feature_columns: Sequence[st
         "JOINED_FILENAME_PREFERENCE",
         ["camels_transformer_joined.parquet", "camels_transformer_joined.csv"],
     )
-    joined_path = next((data_dir / name for name in preferences if (data_dir / name).exists()), None)
-    if joined_path is None:
-        raise FileNotFoundError(
-            f"Could not find joined CAMELS table in {data_dir}. "
-            "Pass --data-npz for the indexed .npz data or --data-dir for joined csv/parquet data."
-        )
+    joined_path = next(data_dir / name for name in preferences if (data_dir / name).exists())
 
     columns = ["basin_id", "date"] + list(feature_columns) + [target_column]
     if joined_path.suffix == ".parquet":
@@ -263,8 +252,6 @@ def basin_store_from_joined(
         basin_ids.append(str(basin_id))
         if model_type == "itransformer":
             basin_code_values = basin_df[basin_code_column].unique()
-            if len(basin_code_values) != 1:
-                raise ValueError(f"Basin {basin_id} has multiple basin_code values.")
             store[str(basin_id)] = {
                 "features": basin_df[list(dynamic_feature_columns)].to_numpy(dtype=np.float32),
                 "basin_code": int(basin_code_values[0]),
@@ -326,17 +313,14 @@ def basin_store_from_npz(
         static_columns = [str(col) for col in data["static_feature_columns"].tolist()]
         metadata_path = npz_path.parent / "camels_transformer_metadata.json"
         if metadata_path.exists():
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-                static_metadata = metadata.get("static_attributes", {})
-                if list(static_metadata.get("columns", [])) == static_columns:
-                    mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
-                    std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
-                    if len(mean) == static_values.shape[1] and len(std) == static_values.shape[1]:
-                        static_values = static_values * std + mean
-                        static_scale = "raw"
-            except Exception:
-                pass
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            static_metadata = metadata.get("static_attributes", {})
+            if list(static_metadata.get("columns", [])) == static_columns:
+                mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
+                std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
+                if len(mean) == static_values.shape[1] and len(std) == static_values.shape[1]:
+                    static_values = static_values * std + mean
+                    static_scale = "raw"
     return store, static_values, basin_ids, None, static_columns, static_scale
 
 
@@ -553,9 +537,6 @@ def main() -> None:
         basin_id_to_slot=basin_id_to_slot,
         model_type=args.model_type,
     )
-    if len(dataset) == 0:
-        raise ValueError("No holdout samples found for the requested data/config.")
-
     device = resolve_device()
     model = build_model(args.model_type, checkpoint, lookback_days).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
