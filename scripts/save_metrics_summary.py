@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -231,7 +232,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not args.notebook.exists():
+        print(f"Notebook not found: {args.notebook}", file=sys.stderr)
+        sys.exit(1)
+
     runs = parse_notebook(args.notebook)
+    if not runs:
+        print("No model-runner cells found in the notebook.", file=sys.stderr)
+        sys.exit(1)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render_markdown(runs, args.notebook) + "\n", encoding="utf-8")
     print(f"Wrote summary: {args.output}", flush=True)

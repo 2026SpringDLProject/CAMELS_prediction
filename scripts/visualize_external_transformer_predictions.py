@@ -136,6 +136,12 @@ class TemporalSummaryiTransformer(nn.Module):
 
     def forward(self, x_dynamic: torch.Tensor, basin_code: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, num_features = x_dynamic.shape
+        if seq_len != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {seq_len}")
+        if num_features != self.num_dynamic_features:
+            raise ValueError(
+                f"Expected num_dynamic_features={self.num_dynamic_features}, got {num_features}"
+            )
 
         x = x_dynamic.transpose(1, 2)
         x_aug = torch.cat(
@@ -155,6 +161,211 @@ class TemporalSummaryiTransformer(nn.Module):
         return self.head(encoded[:, 0, :]).squeeze(-1)
 
 
+class _AutoformerMovingAverage(nn.Module):
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, L, C) — pad with first/last row replication on time axis.
+        pad = (self.kernel_size - 1) // 2
+        front = x[:, 0:1, :].repeat(1, pad, 1)
+        end = x[:, -1:, :].repeat(1, pad, 1)
+        x_pad = torch.cat([front, x, end], dim=1)
+        return self.avg(x_pad.transpose(1, 2)).transpose(1, 2)
+
+
+class _AutoformerSeriesDecomposition(nn.Module):
+    def __init__(self, kernel_size: int):
+        super().__init__()
+        self.moving_avg = _AutoformerMovingAverage(kernel_size)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        trend = self.moving_avg(x)
+        return x - trend, trend
+
+
+class _AutoformerLiteEncoderLayer(nn.Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, moving_avg_kernel: int):
+        super().__init__()
+        self.decomp1 = _AutoformerSeriesDecomposition(moving_avg_kernel)
+        self.decomp2 = _AutoformerSeriesDecomposition(moving_avg_kernel)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attn(x, x, x, need_weights=False)
+        x = x + self.dropout(attn_out)
+        seasonal, trend1 = self.decomp1(x)
+        ffn_out = self.ffn(seasonal)
+        x = seasonal + self.dropout(ffn_out)
+        seasonal, trend2 = self.decomp2(x)
+        return seasonal + trend1 + trend2
+
+
+class AutoformerRegressor(nn.Module):
+    """TemporalSummaryAutoformer — verbatim from `train_autotransformer.ipynb`.
+
+    Forward: input_projection(x_dynamic) + position_embedding (no basin add)
+    → N × AutoformerLite encoder (attn → decomp1 → ffn(seasonal) → decomp2 →
+    seasonal+trend1+trend2) → temporal summary
+    `[last, mean_7, mean_30, mean_90, mean_365]` (5·d_model) → concat with
+    `basin_embedding(basin_code)` (1·d_model) → head."""
+
+    def __init__(
+        self,
+        seq_len: int,
+        num_dynamic_features: int,
+        num_basins: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        moving_avg_kernel: int = 25,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_dynamic_features = num_dynamic_features
+        self.input_projection = nn.Linear(num_dynamic_features, d_model)
+        self.position_embedding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        self.basin_embedding = nn.Embedding(num_basins, d_model)
+        self.layers = nn.ModuleList(
+            [
+                _AutoformerLiteEncoderLayer(
+                    d_model=d_model,
+                    nhead=nhead,
+                    dim_feedforward=dim_feedforward,
+                    dropout=dropout,
+                    moving_avg_kernel=moving_avg_kernel,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        head_in = d_model * 6  # 5-pool summary + basin embedding
+        self.head = nn.Sequential(
+            nn.LayerNorm(head_in),
+            nn.Linear(head_in, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, max(1, d_model // 2)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(max(1, d_model // 2), 1),
+        )
+
+    def forward(self, x_dynamic: torch.Tensor, basin_code: torch.Tensor) -> torch.Tensor:
+        b, l, c = x_dynamic.shape
+        if l != self.seq_len:
+            raise ValueError(f"Expected seq_len={self.seq_len}, got {l}")
+        if c != self.num_dynamic_features:
+            raise ValueError(
+                f"Expected num_dynamic_features={self.num_dynamic_features}, got {c}"
+            )
+
+        basin_code = basin_code.long().view(-1)
+        x = self.input_projection(x_dynamic) + self.position_embedding
+        for layer in self.layers:
+            x = layer(x)
+
+        last_value = x[:, -1, :]
+        mean_7 = x[:, -7:, :].mean(dim=1)
+        mean_30 = x[:, -30:, :].mean(dim=1)
+        mean_90 = x[:, -90:, :].mean(dim=1)
+        mean_365 = x.mean(dim=1)
+
+        temporal_summary = torch.cat([last_value, mean_7, mean_30, mean_90, mean_365], dim=-1)
+        basin_repr = self.basin_embedding(basin_code)
+        out = torch.cat([basin_repr, temporal_summary], dim=-1)
+        return self.head(out).squeeze(-1)
+
+
+BASIN_CODE_MODELS = {"itransformer", "autoformer"}
+
+
+class PrewindowedNpzDataset(Dataset):
+    """Dataset for the auto/processed/camels_transformer_windows.npz format.
+
+    The npz holds (X, y, basin_id, target_date) — already pre-windowed, with
+    X of shape (N, T, F). Filters to a holdout date range, drops invalid
+    targets, and applies feature normalization computed from the pre-holdout
+    subset of the *same* npz (so train/test stats are consistent with what the
+    autoformer actually saw).
+    """
+
+    def __init__(
+        self,
+        npz_path: Path,
+        holdout_start: str,
+        holdout_end: str,
+        basin_id_to_slot: Dict[str, int],
+    ):
+        data = np.load(npz_path, allow_pickle=True)
+        if "X" not in data.files or "y" not in data.files:
+            raise ValueError(
+                f"{npz_path} is not in the prewindowed (X, y, basin_id, target_date) "
+                "format expected by PrewindowedNpzDataset."
+            )
+        X = np.asarray(data["X"], dtype=np.float32)
+        y = np.asarray(data["y"], dtype=np.float32)
+        basin_ids = np.asarray(data["basin_id"]).astype(str)
+        dates = np.asarray(data["target_date"]).astype("datetime64[D]")
+        feature_columns = [str(c) for c in np.asarray(data["feature_columns"]).tolist()]
+
+        start = np.datetime64(holdout_start)
+        end = np.datetime64(holdout_end)
+        train_mask = dates < start
+        if not train_mask.any():
+            raise ValueError(
+                f"No pre-holdout samples (target_date < {holdout_start}) in {npz_path}; "
+                "cannot compute normalization stats."
+            )
+        train_flat = X[train_mask].reshape(-1, X.shape[-1])
+        feature_mean = train_flat.mean(axis=0).astype(np.float32)
+        feature_std = train_flat.std(axis=0).astype(np.float32)
+        feature_std = np.where(feature_std < 1e-6, 1.0, feature_std).astype(np.float32)
+
+        hold_mask = (dates >= start) & (dates <= end) & np.isfinite(y) & (y >= 0)
+        if not hold_mask.any():
+            raise ValueError(
+                f"No valid holdout samples in [{holdout_start}, {holdout_end}] in {npz_path}."
+            )
+
+        self.feature_mean = feature_mean
+        self.feature_std = feature_std
+        self.feature_columns = feature_columns
+        self.X = X[hold_mask]
+        self.y = y[hold_mask]
+        self.basin_ids = basin_ids[hold_mask]
+        self.dates = dates[hold_mask]
+        self.basin_id_to_slot = dict(basin_id_to_slot)
+
+    def __len__(self) -> int:
+        return len(self.X)
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        x = (self.X[idx] - self.feature_mean) / self.feature_std
+        bid = str(self.basin_ids[idx]).zfill(8)
+        slot = self.basin_id_to_slot.get(bid)
+        if slot is None:
+            slot = self.basin_id_to_slot.setdefault(bid, len(self.basin_id_to_slot))
+        return {
+            "x": torch.from_numpy(x).float(),
+            "y": torch.tensor(float(self.y[idx]), dtype=torch.float32),
+            "basin_slot": torch.tensor(int(slot), dtype=torch.long),
+            "target_date": str(self.dates[idx]),
+        }
+
+
 def resolve_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -165,6 +376,93 @@ def resolve_device() -> torch.device:
 
 def load_checkpoint(path: Path) -> Dict:
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _infer_autoformer_hparams_from_state_dict(state_dict: Dict, nhead: int) -> Dict[str, int]:
+    d_model = state_dict["seasonal_proj.weight"].shape[0]
+    num_features = state_dict["seasonal_proj.weight"].shape[1]
+    dim_ff = state_dict["encoder.layers.0.linear1.weight"].shape[0]
+    num_layers = sum(
+        1 for k in state_dict
+        if k.startswith("encoder.layers.") and k.endswith(".self_attn.in_proj_weight")
+    )
+    if d_model % nhead != 0:
+        raise ValueError(
+            f"d_model={d_model} is not divisible by nhead={nhead}; pass --autoformer-nhead "
+            f"with a value that divides {d_model}."
+        )
+    return {
+        "d_model": int(d_model),
+        "nhead": int(nhead),
+        "num_layers": int(num_layers),
+        "dim_feedforward": int(dim_ff),
+        "num_features": int(num_features),
+    }
+
+
+def merge_bare_state_dict_with_metadata(
+    state_dict_path: Path,
+    metadata_checkpoint_path: Path,
+    autoformer_nhead: int,
+    autoformer_dropout: float,
+    autoformer_moving_avg_kernel: int,
+) -> Dict:
+    """Bare-state_dict autoformer files in `auto/processed/` carry no metadata.
+    Source feature_columns / feature_mean / feature_std / num_basins from a
+    co-trained full checkpoint (e.g. the vanilla transformer's ckpt) and infer
+    architecture sizes from the state_dict shapes."""
+    raw = torch.load(state_dict_path, map_location="cpu", weights_only=False)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Expected an OrderedDict-like state_dict at {state_dict_path}")
+    if "seasonal_proj.weight" not in raw:
+        raise ValueError(
+            f"State_dict at {state_dict_path} doesn't look like an autoformer "
+            "(missing 'seasonal_proj.weight')."
+        )
+
+    meta = torch.load(metadata_checkpoint_path, map_location="cpu", weights_only=False)
+    if "feature_mean" not in meta or "feature_std" not in meta:
+        raise ValueError(
+            f"Metadata checkpoint at {metadata_checkpoint_path} is missing "
+            "'feature_mean'/'feature_std' — pass a different --autoformer-meta."
+        )
+
+    inferred = _infer_autoformer_hparams_from_state_dict(raw, nhead=autoformer_nhead)
+    if inferred["num_features"] != len(meta["feature_columns"]):
+        raise ValueError(
+            f"State_dict expects {inferred['num_features']} input features but "
+            f"metadata checkpoint has {len(meta['feature_columns'])} feature_columns."
+        )
+    if inferred["num_features"] != len(np.asarray(meta["feature_mean"]).reshape(-1)):
+        raise ValueError(
+            f"State_dict expects {inferred['num_features']} input features but "
+            f"feature_mean has shape {np.asarray(meta['feature_mean']).shape}. "
+            "Use a metadata checkpoint whose normalization matches (e.g. the vanilla "
+            "transformer ckpt)."
+        )
+
+    return {
+        "model_state_dict": raw,
+        "feature_columns": list(meta["feature_columns"]),
+        "target_column": meta["target_column"],
+        "feature_mean": np.asarray(meta["feature_mean"], dtype=np.float32),
+        "feature_std": np.asarray(meta["feature_std"], dtype=np.float32),
+        "dynamic_feature_columns": list(
+            meta.get("dynamic_feature_columns", meta["feature_columns"][:-1])
+        ),
+        "basin_code_column": str(meta.get("basin_code_column", "basin_code")),
+        "num_basins": int(meta.get("num_basins") or 671),
+        "config": dict(meta.get("config", {})),
+        "best_hparams": {
+            "d_model": inferred["d_model"],
+            "nhead": inferred["nhead"],
+            "num_layers": inferred["num_layers"],
+            "dim_feedforward": inferred["dim_feedforward"],
+            "dropout": float(autoformer_dropout),
+            "moving_avg_kernel": int(autoformer_moving_avg_kernel),
+            "batch_size": int(meta.get("best_hparams", {}).get("batch_size", 128)),
+        },
+    }
 
 
 def localize_config_paths(config: Dict, checkpoint_path: Path, data_dir: Optional[Path]) -> Dict:
@@ -222,7 +520,12 @@ def read_joined_table(data_dir: Path, config: Dict, feature_columns: Sequence[st
         "JOINED_FILENAME_PREFERENCE",
         ["camels_transformer_joined.parquet", "camels_transformer_joined.csv"],
     )
-    joined_path = next(data_dir / name for name in preferences if (data_dir / name).exists())
+    joined_path = next((data_dir / name for name in preferences if (data_dir / name).exists()), None)
+    if joined_path is None:
+        raise FileNotFoundError(
+            f"Could not find joined CAMELS table in {data_dir}. "
+            "Pass --data-npz for the indexed .npz data or --data-dir for joined csv/parquet data."
+        )
 
     columns = ["basin_id", "date"] + list(feature_columns) + [target_column]
     if joined_path.suffix == ".parquet":
@@ -250,8 +553,10 @@ def basin_store_from_joined(
     for basin_id, basin_df in df.groupby("basin_id", sort=True):
         basin_df = basin_df.sort_values("date").reset_index(drop=True)
         basin_ids.append(str(basin_id))
-        if model_type == "itransformer":
+        if model_type in BASIN_CODE_MODELS:
             basin_code_values = basin_df[basin_code_column].unique()
+            if len(basin_code_values) != 1:
+                raise ValueError(f"Basin {basin_id} has multiple basin_code values.")
             store[str(basin_id)] = {
                 "features": basin_df[list(dynamic_feature_columns)].to_numpy(dtype=np.float32),
                 "basin_code": int(basin_code_values[0]),
@@ -278,7 +583,7 @@ def basin_store_from_npz(
     data = np.load(npz_path, allow_pickle=True)
     all_columns = [str(col) for col in data["feature_columns"].tolist()]
     column_index = {name: idx for idx, name in enumerate(all_columns)}
-    selected_columns = list(dynamic_feature_columns) if model_type == "itransformer" else list(feature_columns)
+    selected_columns = list(dynamic_feature_columns) if model_type in BASIN_CODE_MODELS else list(feature_columns)
     selected_idx = [column_index[name] for name in selected_columns]
     basin_code_idx = column_index.get(basin_code_column)
 
@@ -301,7 +606,7 @@ def basin_store_from_npz(
             "target": basin_targets[valid],
             "dates": basin_dates[valid],
         }
-        if model_type == "itransformer":
+        if model_type in BASIN_CODE_MODELS:
             payload["basin_code"] = int(features[mask][:, basin_code_idx][order][valid][0])
         store[basin_id] = payload
 
@@ -313,14 +618,17 @@ def basin_store_from_npz(
         static_columns = [str(col) for col in data["static_feature_columns"].tolist()]
         metadata_path = npz_path.parent / "camels_transformer_metadata.json"
         if metadata_path.exists():
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            static_metadata = metadata.get("static_attributes", {})
-            if list(static_metadata.get("columns", [])) == static_columns:
-                mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
-                std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
-                if len(mean) == static_values.shape[1] and len(std) == static_values.shape[1]:
-                    static_values = static_values * std + mean
-                    static_scale = "raw"
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                static_metadata = metadata.get("static_attributes", {})
+                if list(static_metadata.get("columns", [])) == static_columns:
+                    mean = np.asarray(static_metadata.get("mean", []), dtype=np.float64)
+                    std = np.asarray(static_metadata.get("std", []), dtype=np.float64)
+                    if len(mean) == static_values.shape[1] and len(std) == static_values.shape[1]:
+                        static_values = static_values * std + mean
+                        static_scale = "raw"
+            except Exception:
+                pass
     return store, static_values, basin_ids, None, static_columns, static_scale
 
 
@@ -400,7 +708,7 @@ class ExternalWindowDataset(Dataset):
             "basin_slot": torch.tensor(self.basin_id_to_slot[basin_id], dtype=torch.long),
             "target_date": str(np.datetime_as_string(series["dates"][target_idx], unit="D")),
         }
-        if self.model_type == "itransformer":
+        if self.model_type in BASIN_CODE_MODELS:
             item["basin_code"] = torch.tensor(int(series["basin_code"]), dtype=torch.long)
         return item
 
@@ -423,7 +731,7 @@ def collect_predictions(model: nn.Module, loader: DataLoader, device: torch.devi
     with torch.no_grad():
         for batch in loader:
             x = batch["x"].to(device)
-            if model_type == "itransformer":
+            if model_type in BASIN_CODE_MODELS:
                 pred = model(x, batch["basin_code"].to(device))
             else:
                 pred = model(x)
@@ -452,6 +760,18 @@ def build_model(model_type: str, checkpoint: Dict, lookback_days: int) -> nn.Mod
             dim_feedforward=int(hparams["dim_feedforward"]),
             dropout=float(hparams["dropout"]),
         )
+    if model_type == "autoformer":
+        return AutoformerRegressor(
+            seq_len=lookback_days,
+            num_dynamic_features=len(checkpoint["dynamic_feature_columns"]),
+            num_basins=int(checkpoint["num_basins"]),
+            d_model=int(hparams["d_model"]),
+            nhead=int(hparams["nhead"]),
+            num_layers=int(hparams["num_layers"]),
+            dim_feedforward=int(hparams["dim_feedforward"]),
+            dropout=float(hparams["dropout"]),
+            moving_avg_kernel=int(hparams.get("moving_avg_kernel", 25)),
+        )
     return VanillaTransformerRegressor(
         num_features=len(checkpoint["feature_columns"]),
         d_model=int(hparams["d_model"]),
@@ -464,9 +784,13 @@ def build_model(model_type: str, checkpoint: Dict, lookback_days: int) -> nn.Mod
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Apply TFT-style prediction analysis plots to iTransformer or vanilla Transformer checkpoints."
+        description="Apply TFT-style prediction analysis plots to iTransformer, Autoformer, or vanilla Transformer checkpoints."
     )
-    parser.add_argument("--model-type", choices=["itransformer", "vanilla"], required=True)
+    parser.add_argument(
+        "--model-type",
+        choices=["itransformer", "vanilla", "autoformer"],
+        required=True,
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--data-npz", type=Path, default=None, help="Prepared indexed .npz data.")
     parser.add_argument("--data-dir", type=Path, default=None, help="Processed directory with joined csv/parquet + metadata.")
@@ -478,6 +802,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--basin-id", type=str, default=None)
     parser.add_argument("--basin-slot", type=int, default=None)
+    parser.add_argument(
+        "--autoformer-meta",
+        type=Path,
+        default=None,
+        help=(
+            "For --model-type=autoformer when --checkpoint is a bare state_dict "
+            "(e.g. files under CAMELS_data_load-auto/processed/). Path to a full "
+            "checkpoint to source feature_columns / feature_mean / feature_std / "
+            "num_basins from. Defaults to the vanilla transformer checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--autoformer-nhead",
+        type=int,
+        default=4,
+        help="Attention heads for the autoformer (cannot be inferred from state_dict).",
+    )
+    parser.add_argument(
+        "--autoformer-dropout",
+        type=float,
+        default=0.1,
+        help="Dropout used at training time (cannot be inferred from state_dict).",
+    )
+    parser.add_argument(
+        "--autoformer-moving-avg-kernel",
+        type=int,
+        default=25,
+        help="Moving-average kernel for the seasonal/trend decomposition.",
+    )
     return parser.parse_args()
 
 
@@ -496,47 +849,78 @@ def main() -> None:
     dynamic_feature_columns = list(checkpoint.get("dynamic_feature_columns", feature_columns[:-1]))
     basin_code_column = str(checkpoint.get("basin_code_column", "basin_code"))
 
+    holdout_start = config.get("INDEPENDENT_VAL_START", "2008-01-01")
+    holdout_end = config.get("INDEPENDENT_VAL_END", "2014-12-31")
+
+    prewindowed = False
     if args.data_npz is not None:
-        print(f"Reading prepared windows from: {args.data_npz}", flush=True)
-        basin_store, static_values, basin_ids, _, static_columns, static_scale = basin_store_from_npz(
+        npz_files = set(np.load(args.data_npz, allow_pickle=True).files)
+        prewindowed = "X" in npz_files and "y" in npz_files
+
+    if prewindowed:
+        print(f"Reading prewindowed (X, y) dataset from: {args.data_npz}", flush=True)
+        npz = np.load(args.data_npz, allow_pickle=True)
+        basin_ids = sorted({str(b).zfill(8) for b in np.asarray(npz["basin_id"]).tolist()})
+        basin_id_to_slot = {bid: i for i, bid in enumerate(basin_ids)}
+        dataset = PrewindowedNpzDataset(
             args.data_npz,
-            feature_columns=feature_columns,
-            target_column=target_column,
-            model_type=args.model_type,
-            dynamic_feature_columns=dynamic_feature_columns,
-            basin_code_column=basin_code_column,
+            holdout_start=holdout_start,
+            holdout_end=holdout_end,
+            basin_id_to_slot=basin_id_to_slot,
+        )
+        static_values = None
+        static_columns = []
+        static_scale = "z-score"
+        print(
+            f"  feature_mean (computed from pre-{holdout_start} subset of npz): "
+            f"{np.asarray(dataset.feature_mean).round(3).tolist()}",
+            flush=True,
         )
     else:
-        data_dir = Path(config["DATA_DIR"])
-        print(f"Reading joined table from: {data_dir}", flush=True)
-        df = read_joined_table(data_dir, config, feature_columns, target_column)
-        basin_store, static_values, basin_ids, _, static_columns, static_scale = basin_store_from_joined(
-            df,
-            feature_columns=feature_columns,
-            target_column=target_column,
-            model_type=args.model_type,
-            dynamic_feature_columns=dynamic_feature_columns,
-            basin_code_column=basin_code_column,
-        )
+        if args.data_npz is not None:
+            print(f"Reading prepared windows from: {args.data_npz}", flush=True)
+            basin_store, static_values, basin_ids, _, static_columns, static_scale = basin_store_from_npz(
+                args.data_npz,
+                feature_columns=feature_columns,
+                target_column=target_column,
+                model_type=args.model_type,
+                dynamic_feature_columns=dynamic_feature_columns,
+                basin_code_column=basin_code_column,
+            )
+        else:
+            data_dir = Path(config["DATA_DIR"])
+            print(f"Reading joined table from: {data_dir}", flush=True)
+            df = read_joined_table(data_dir, config, feature_columns, target_column)
+            basin_store, static_values, basin_ids, _, static_columns, static_scale = basin_store_from_joined(
+                df,
+                feature_columns=feature_columns,
+                target_column=target_column,
+                model_type=args.model_type,
+                dynamic_feature_columns=dynamic_feature_columns,
+                basin_code_column=basin_code_column,
+            )
 
-    target_map = build_holdout_target_map(
-        basin_store,
-        lookback_days=lookback_days,
-        horizon_days=horizon_days,
-        holdout_start=config.get("INDEPENDENT_VAL_START", "2008-01-01"),
-        holdout_end=config.get("INDEPENDENT_VAL_END", "2014-12-31"),
-    )
-    basin_id_to_slot = {basin_id: idx for idx, basin_id in enumerate(basin_ids)}
-    dataset = ExternalWindowDataset(
-        basin_store=basin_store,
-        target_map=target_map,
-        lookback_days=lookback_days,
-        horizon_days=horizon_days,
-        feature_mean=np.asarray(checkpoint["feature_mean"], dtype=np.float32),
-        feature_std=np.asarray(checkpoint["feature_std"], dtype=np.float32),
-        basin_id_to_slot=basin_id_to_slot,
-        model_type=args.model_type,
-    )
+        target_map = build_holdout_target_map(
+            basin_store,
+            lookback_days=lookback_days,
+            horizon_days=horizon_days,
+            holdout_start=holdout_start,
+            holdout_end=holdout_end,
+        )
+        basin_id_to_slot = {basin_id: idx for idx, basin_id in enumerate(basin_ids)}
+        dataset = ExternalWindowDataset(
+            basin_store=basin_store,
+            target_map=target_map,
+            lookback_days=lookback_days,
+            horizon_days=horizon_days,
+            feature_mean=np.asarray(checkpoint["feature_mean"], dtype=np.float32),
+            feature_std=np.asarray(checkpoint["feature_std"], dtype=np.float32),
+            basin_id_to_slot=basin_id_to_slot,
+            model_type=args.model_type,
+        )
+    if len(dataset) == 0:
+        raise ValueError("No holdout samples found for the requested data/config.")
+
     device = resolve_device()
     model = build_model(args.model_type, checkpoint, lookback_days).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])

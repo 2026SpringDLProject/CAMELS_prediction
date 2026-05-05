@@ -22,7 +22,10 @@ def resolve_project_path(path_value: str) -> Path:
 
 def load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}, got {type(payload).__name__}")
+    return payload
 
 
 def build_data_prep_config(config: dict) -> DataPrepConfig:
@@ -43,6 +46,13 @@ def build_data_prep_config(config: dict) -> DataPrepConfig:
 def discover_available_basin_ids(cfg: DataPrepConfig) -> List[str]:
     forcing_zip, actual_forcing_product, notes = choose_forcing_source(cfg)
 
+    if not _is_readable_zip(cfg.timeseries_zip):
+        raise FileNotFoundError(
+            f"Main CAMELS time-series zip is missing or unreadable: {cfg.timeseries_zip}"
+        )
+    if not _is_readable_zip(forcing_zip):
+        raise FileNotFoundError(f"Forcing zip is missing or unreadable: {forcing_zip}")
+
     forcing_paths = index_camels_zip(forcing_zip, actual_forcing_product)
     target_paths = index_camels_zip(cfg.timeseries_zip, actual_forcing_product)
     available = sorted(set(forcing_paths.forcing) & set(target_paths.streamflow))
@@ -57,6 +67,12 @@ def discover_available_basin_ids(cfg: DataPrepConfig) -> List[str]:
 
 
 def choose_basin_ids(available: List[str], count: int, seed: int) -> List[str]:
+    if count < 1:
+        raise ValueError(f"count must be >= 1, got {count}")
+    if count > len(available):
+        raise ValueError(
+            f"Requested {count} basins, but only {len(available)} complete basin pairs are available"
+        )
     rng = np.random.default_rng(seed)
     indices = np.sort(rng.choice(len(available), size=count, replace=False))
     return [available[idx] for idx in indices]
